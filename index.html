@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Todo App</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <h1>✓ Todo</h1>
+      <button id="notify-btn" class="btn btn-ghost w100" type="button">🔔 Enable reminders</button>
+      <div id="notify-status" class="notify-status muted"></div>
+    </div>
+
+    <div class="sidebar-section">
+      <nav id="project-list" class="nav projects" aria-label="Projects"></nav>
+      <form id="add-project-form" class="add-project">
+        <input id="new-project" type="text" placeholder="New project…" autocomplete="off">
+        <button class="btn btn-ghost" type="submit">Add</button>
+      </form>
+      <div id="project-error" class="error"></div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-title">Tags</div>
+      <nav id="tag-list" class="nav tags" aria-label="Tags"></nav>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div id="reminder-bar" class="reminder-bar hidden" role="status"></div>
+
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search tasks…" aria-label="Search tasks">
+      <div class="seg" id="status-filter" role="group" aria-label="Status filter">
+        <button type="button" data-status="all" class="active">All</button>
+        <button type="button" data-status="active">Active</button>
+        <button type="button" data-status="completed">Completed</button>
+      </div>
+      <select id="due-filter" aria-label="Due date filter">
+        <option value="all">Any due date</option>
+        <option value="overdue">Overdue</option>
+        <option value="today">Today</option>
+        <option value="upcoming">Upcoming</option>
+        <option value="none">No due date</option>
+      </select>
+      <select id="priority-filter" aria-label="Priority filter">
+        <option value="">Any priority</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low</option>
+        <option value="none">No priority</option>
+      </select>
+    </div>
+
+    <form id="task-form" aria-label="Add task">
+      <input id="f-title" type="text" placeholder="Task title" required autocomplete="off">
+      <textarea id="f-notes" rows="2" placeholder="Notes (optional)"></textarea>
+      <div class="form-row">
+        <input id="f-due" type="date" title="Due date">
+        <select id="f-project" title="Project"></select>
+        <select id="f-priority" title="Priority">
+          <option value="">No priority</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+        </select>
+        <input id="f-tags" type="text" placeholder="tags, comma-separated" autocomplete="off">
+        <button class="btn btn-primary" type="submit">Add task</button>
+      </div>
+    </form>
+
+    <div id="bulkbar" class="bulkbar hidden">
+      <span id="bulk-count"></span>
+      <div class="bulk-actions">
+        <button id="bulk-complete" class="btn btn-ghost" type="button">✓ Complete</button>
+        <button id="bulk-active" class="btn btn-ghost" type="button">◻ Mark active</button>
+        <button id="bulk-delete" class="btn btn-danger" type="button">🗑 Delete</button>
+        <button id="bulk-clear" class="btn btn-ghost" type="button">Clear</button>
+      </div>
+    </div>
+
+    <ul id="task-list" class="tasks"></ul>
+    <div id="empty-state" class="empty hidden">No tasks match your current view.</div>
+    <footer class="foot muted">Data is stored locally in your browser (localStorage).</footer>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
