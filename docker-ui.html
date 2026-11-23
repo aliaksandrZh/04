@@ -1,0 +1,1866 @@
+<!doctype html>
+<!--
+  docker-ui.html — single-file, zero-dependency visual builder for a Dockerfile + docker-compose.yml
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+  Everything is inline: no frameworks, no CDN, no build step, no network requests. Open directly
+  via file://. Vanilla JS (ES2020) + CSS only.
+
+  STRUCTURE
+    <style>   design tokens (dark default + light theme), 3-pane responsive grid, components
+              (buttons / fields / tabs / toasts), syntax-highlight colors, reduced-motion guard
+    <script>  numbered sections:
+      1  SEED state + constants (step types, common images, restart policies)
+      2  State store — localStorage["docker-ui-state-v1"] (schema 1), try/catch + memory fallback
+      3  DOM helpers — h(), esc(), debounce(), inline SVG icon() set
+      4  Section renderers — Image / Compose / Volumes / Networks / Environment + sidebar nav
+      5  Repeater machinery — add/remove actions, HTML5 drag-to-reorder + keyboard move buttons
+      6  Generators — hand-written YAML emitter (yamlScalar quoting rules), Dockerfile emitter
+         (120-char "&&" wrap rule for RUN), .env writer
+      7  Validation — errors E1–E8 (block download only), warnings (${KEY} refs, version key)
+      8  Preview — WAI-ARIA tablist (roving tabindex, arrow keys), hand-rolled highlighters,
+         Copy (clipboard + execCommand fallback) / Download (Blob) per tab, "copy as docker run"
+      9  Toast (service-removal cascade report) + aria-live announcer
+     10  Bootstrap — restore-or-seed, global event delegation (data-f paths + data-action路由),
+         debounced (150 ms) regenerate + persist
+
+  STATE SHAPES (all persisted; see seedState())
+    docker.stages[]        stage { id, name, baseImage, steps[] }
+    steps[]                { id, type, ...type-specific fields }
+    services[]             { id, name, source, image|buildPath+dockerfileName, containerName,
+                             restart, ports[], dependsOn[], env[], command, healthcheck,
+                             volumeMounts[], networks[] }
+    volumes[] / networks[] top-level declarations; dotenv[] = .env editor rows
+
+  NOTES
+    - Removing a service scrubs it from other depends_on lists and drops volumes/networks that
+      only it used (toast reports exactly what happened).
+    - The .env preview tab is hidden while no keys are defined; if it hides while active the UI
+      falls back to docker-compose.yml and announces the change via aria-live.
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Docker UI — Dockerfile &amp; Compose builder</title>
+<style>
+/* ============================================================= design tokens ========== */
+:root{
+  --bg:#0f1117; --panel:#171a21; --panel2:#1e232d; --border:#262b36;
+  --text:#e8ebf2; --muted:#9aa3b2;
+  --accent:#4f8cff; --accent-soft:rgba(79,140,255,.22);
+  --error:#ff5d5d; --error-soft:rgba(255,93,93,.12);
+  --success:#3ecf8e; --warn:#ffb84f;
+  --code-bg:#0b0d12;
+  --tk-kw:#6ea8ff; --tk-str:#3ecf8e; --tk-comment:#7d8797; --tk-num:#e2b45c;
+  --tk-key:#9fc2ff; --tk-flag:#c9a7e8; --tk-punct:#8b94a6;
+  --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --radius:6px; --t:150ms;
+}
+[data-theme="light"]{
+  --bg:#f2f4f8; --panel:#ffffff; --panel2:#eceff5; --border:#d5dae4;
+  --text:#191f2e; --muted:#5c6575;
+  --accent:#3163d8; --accent-soft:rgba(49,99,216,.16);
+  --error:#cf3737; --error-soft:rgba(207,55,55,.10);
+  --success:#1d9a63; --warn:#9a6a10;
+  --code-bg:#e9ecf3;
+  --tk-kw:#2857c9; --tk-str:#177a4c; --tk-comment:#7b8494; --tk-num:#9a6a10;
+  --tk-key:#2857c9; --tk-flag:#7b47a8; --tk-punct:#66707e;
+}
+/* ============================================================= base / layout ========== */
+*{box-sizing:border-box}
+html{height:100%}
+body{
+  margin:0; min-height:100vh; background:var(--bg); color:var(--text);
+  font:14px/1.5 var(--sans);
+}
+h1,h2{margin:0}
+button{font:inherit; color:inherit}
+input,select,textarea{
+  font:inherit; color:var(--text); background:var(--panel2);
+  border:1px solid var(--border); border-radius:var(--radius);
+  padding:6px 9px; width:100%; min-width:0;
+  transition:border-color var(--t),box-shadow var(--t),background var(--t);
+}
+input:focus,select:focus,textarea:focus{
+  outline:none; border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft); /* allowed: focused inputs */
+}
+input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7}
+input.mono,textarea.mono,.code{font-family:var(--mono)}
+textarea{resize:vertical;min-height:90px}
+:root{--accent-color:var(--accent)}
+input[type="checkbox"],input[type="radio"],select{accent-color:var(--accent)}
+input[type="checkbox"],input[type="radio"]{width:auto;flex:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+.app-header{
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:10px 18px; background:var(--panel); border-bottom:1px solid var(--border);
+}
+.app-title{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:650}
+.app-sub{font-size:12px;color:var(--muted);font-weight:400}
+.header-actions{display:flex;gap:8px}
+.layout{
+  display:grid; grid-template-columns:260px minmax(0,1fr) minmax(380px,42%);
+  align-items:start;
+}
+.sidebar{
+  background:var(--panel); border-right:1px solid var(--border);
+  padding:12px 10px; display:flex; flex-direction:column; gap:4px;
+  position:sticky; top:0; max-height:100vh; overflow:auto;
+}
+.form-panel{padding:18px 20px 60px; min-height:40vh}
+.preview{
+  background:var(--panel); border-left:1px solid var(--border);
+  padding:14px; display:flex; flex-direction:column; gap:10px;
+  position:sticky; top:0; max-height:100vh; overflow:auto;
+}
+@media (min-width:900px){
+  .sidebar{top:8px;max-height:calc(100vh - 16px)}
+  .preview{top:8px;max-height:calc(100vh - 16px)}
+}
+@media (max-width:899px){
+  .layout{grid-template-columns:1fr}
+  .sidebar{
+    position:static; max-height:none; flex-direction:row; overflow-x:auto;
+    padding:10px; border-right:none; border-bottom:1px solid var(--border);
+  }
+  .nav-btn{width:auto;white-space:nowrap;border:1px solid var(--border)}
+  .preview{position:static;max-height:none;border-left:none;border-top:1px solid var(--border)}
+}
+/* ============================================================= nav / sections ========= */
+.nav-btn{
+  display:flex; align-items:center; gap:10px; width:100%;
+  padding:9px 12px; border-radius:var(--radius); border:1px solid transparent;
+  background:transparent; color:var(--muted); text-align:left; cursor:pointer;
+  transition:background var(--t),color var(--t),border-color var(--t);
+}
+.nav-btn:hover{color:var(--text);background:var(--panel2)}
+.nav-btn[aria-current="page"]{background:var(--panel2);color:var(--text);border-color:var(--border)}
+.icon{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.sect-h{display:flex;align-items:center;gap:9px;font-size:16px;font-weight:650;margin:2px 0 6px}
+.sect-h .icon{width:18px;height:18px;color:var(--accent)}
+.hint{font-size:12px;color:var(--muted);margin:4px 0 12px}
+fieldset{
+  border:1px solid var(--border); border-radius:var(--radius);
+  padding:10px 12px 12px; margin:0 0 14px; min-inline-size:0;
+}
+legend,.fs-legend{
+  font-size:11.5px; font-weight:650; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--muted); padding:0 6px;
+}
+.subcard{border:1px dashed var(--border);border-radius:var(--radius);padding:8px 10px;margin:8px 0}
+.field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.field-name{font-size:12px;color:var(--muted);font-weight:600}
+.flds{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:10px 14px;align-items:end;margin:8px 0 2px}
+.rowline{display:flex;gap:8px;align-items:center;margin:6px 0}
+.rowline input,.rowline select{flex:1;min-width:0}
+.toggle{display:flex;align-items:center;gap:8px;font-weight:550;margin:8px 0;cursor:pointer}
+.toggle input{margin:0}
+.step{position:relative;margin:8px 0}
+.step-head{display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
+.step-head select{width:auto;min-width:130px}
+.draggable{cursor:grab}
+.dragging{opacity:.55}
+.drop-target{outline:2px dashed var(--accent);outline-offset:-2px}
+/* ============================================================= buttons =============== */
+.btn{
+  display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+  border-radius:var(--radius); border:1px solid var(--border); background:transparent;
+  padding:6px 12px; font-size:13px; font-weight:550;
+  transition:background var(--t),border-color var(--t),color var(--t);
+}
+.btn:hover{border-color:var(--accent)}
+.btn-sm{padding:4px 10px;font-size:12.5px}
+.btn-icon{width:26px;height:26px;padding:0;justify-content:center;font-size:13px}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent);filter:brightness(1.08)}
+.btn-ghost{background:transparent}
+.btn-ghost:hover{background:var(--panel2)}
+.btn-danger{color:var(--error);border-color:transparent;background:transparent}
+.btn-danger:hover{color:var(--error);border-color:var(--error);background:var(--error-soft)}
+.btn[disabled]{opacity:.45;cursor:not-allowed;pointer-events:none}
+/* ============================================================= preview =============== */
+.preview-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.validation:empty{display:none}
+.v-ok{color:var(--success);font-size:12.5px;font-weight:600}
+.v-list{margin:6px 0;padding-inline-start:20px;font-size:12.5px}
+.v-err{color:var(--error)}
+.v-warn{color:var(--warn)}
+.v-banner{
+  display:flex;gap:8px;align-items:flex-start;margin:8px 0;padding:9px 11px;
+  border:1px solid var(--warn);border-radius:var(--radius);
+  color:var(--warn);font-size:12.5px;
+}
+.v-banner .icon{margin-top:1px}
+.tablist{display:flex;gap:4px;border-bottom:1px solid var(--border)}
+.tab{
+  border:1px solid transparent;border-bottom:none;border-radius:8px 8px 0 0;
+  background:transparent;color:var(--muted);padding:7px 14px;cursor:pointer;
+  font-size:13px;font-weight:600;
+  transition:color var(--t),background var(--t),border-color var(--t);
+}
+.tab:hover{color:var(--text)}
+.tab[aria-selected="true"]{
+  background:var(--code-bg);color:var(--text);border-color:var(--border);
+  box-shadow:0 -2px 6px rgba(0,0,0,.22); /* allowed: active tab */
+}
+[data-theme="light"] .tab[aria-selected="true"]{box-shadow:0 -2px 6px rgba(0,0,0,.10)}
+.code{
+  margin:0; background:var(--code-bg); border:1px solid var(--border);
+  border-radius:var(--radius); padding:12px 14px; overflow:auto;
+  font:12.5px/1.65 var(--mono); white-space:pre; min-height:140px;
+}
+.tk-kw{color:var(--tk-kw);font-weight:600}
+.tk-str{color:var(--tk-str)}
+.tk-comment{color:var(--tk-comment);font-style:italic}
+.tk-num{color:var(--tk-num)}
+.tk-key{color:var(--tk-key)}
+.tk-flag{color:var(--tk-flag)}
+.tk-punct{color:var(--tk-punct)}
+/* ============================================================= toasts / misc ========= */
+.toasts{position:fixed;right:14px;bottom:14px;z-index:60;display:flex;flex-direction:column;gap:8px;max-width:min(70ch,86vw)}
+.toast{
+  display:flex;align-items:center;gap:10px;
+  background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--success);
+  border-radius:var(--radius);padding:9px 12px;font-size:13px;
+  animation:toast-in 150ms ease-out;
+}
+.toast.warn{border-left-color:var(--warn)}
+.toast-msg{flex:1}
+.toast-x{flex:none}
+@keyframes toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.visually-hidden{
+  position:absolute!important;width:1px;height:1px;margin:-1px;padding:0;border:0;
+  clip:rect(0 0 0 0);clip-path:inset(50%);overflow:hidden;white-space:nowrap;
+}
+.skip-link{
+  position:fixed;top:-40px;left:12px;z-index:100;background:var(--accent);color:#fff;
+  padding:8px 12px;border-radius:var(--radius);text-decoration:none;font-weight:600;
+  transition:top var(--t);
+}
+.skip-link:focus{top:10px}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{transition:none!important;animation:none!important}
+}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#preview-region">Skip to generated output</a>
+
+<header class="app-header">
+  <h1 class="app-title">
+    <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="6" width="13" height="7.5" rx="1.5"/><path d="M4.5 6V3.5h3V6M8 6V4h3v2"/></svg>
+    Docker UI <span class="app-sub">— Dockerfile &amp; Compose builder</span>
+  </h1>
+  <div class="header-actions">
+    <button id="btn-theme" class="btn btn-ghost" data-action="theme" type="button">Theme</button>
+    <button class="btn btn-danger" data-action="reset" type="button">Reset</button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav id="sidebar" class="sidebar" aria-label="Configuration sections"></nav>
+  <main id="form-panel" class="form-panel" aria-label="Configuration form"></main>
+  <aside id="preview-region" class="preview" aria-label="Generated files preview" tabindex="-1">
+    <div class="preview-toolbar">
+      <button id="btn-run" class="btn btn-ghost btn-sm" data-action="copy-run" type="button" hidden>Copy as docker run</button>
+      <button id="btn-copy" class="btn btn-primary btn-sm" data-action="copy" type="button">Copy</button>
+      <button id="btn-download" class="btn btn-ghost btn-sm" data-action="download" type="button">Download</button>
+    </div>
+    <div id="validation" role="status" aria-live="polite" class="validation"></div>
+    <div class="tablist" role="tablist" aria-label="Generated files">
+      <button id="tab-dockerfile" class="tab" role="tab" data-action="tab" data-tab="dockerfile"
+              aria-selected="true" aria-controls="panel-dockerfile" tabindex="0" type="button">Dockerfile</button>
+      <button id="tab-compose" class="tab" role="tab" data-action="tab" data-tab="compose"
+              aria-selected="false" aria-controls="panel-compose" tabindex="-1" type="button">docker-compose.yml</button>
+      <button id="tab-env" class="tab" role="tab" data-action="tab" data-tab="env"
+              aria-selected="false" aria-controls="panel-env" tabindex="-1" hidden type="button">.env</button>
+    </div>
+    <pre id="panel-dockerfile" class="code" role="tabpanel" aria-labelledby="tab-dockerfile" tabindex="0"><code id="code-dockerfile"></code></pre>
+    <pre id="panel-compose" class="code" role="tabpanel" aria-labelledby="tab-compose" tabindex="0" hidden><code id="code-compose"></code></pre>
+    <pre id="panel-env" class="code" role="tabpanel" aria-labelledby="tab-env" tabindex="0" hidden><code id="code-env"></code></pre>
+  </aside>
+</div>
+
+<div id="toasts" class="toasts"></div>
+<div id="live-a11y" class="visually-hidden" aria-live="polite"></div>
+
+<datalist id="dl-images">
+  <option value="node:20-alpine"></option><option value="node:22-alpine"></option>
+  <option value="python:3.12-slim"></option><option value="nginx:alpine"></option>
+  <option value="ubuntu:24.04"></option><option value="alpine:3.20"></option>
+  <option value="golang:1.22-alpine"></option><option value="redis:7-alpine"></option>
+  <option value="postgres:16-alpine"></option><option value="debian:bookworm-slim"></option>
+  <option value="eclipse-temurin:21-alpine"></option><option value="denoland/deno:alpine"></option>
+</datalist>
+<datalist id="dl-drivers">
+  <option value="local"></option><option value="tmpfs"></option><option value="bind"></option>
+  <option value="nfs"></option><option value="bridge"></option><option value="host"></option>
+  <option value="macvlan"></option><option value="overlay"></option><option value="none"></option>
+</datalist>
+
+<script>
+'use strict';
+/* ============================================================= 1. SEED + constants ==== */
+const STORAGE_KEY = 'docker-ui-state-v1';
+const DEBOUNCE_MS = 150;
+const WRAP_COL = 120;
+
+const STEP_TYPES = ['RUN','COPY','WORKDIR','ENV','ARG','EXPOSE','USER','CMD','ENTRYPOINT','HEALTHCHECK'];
+const RESTARTS = ['no','always','on-failure','unless-stopped'];
+const COMPOSE_VERSIONS = ['3.9','3.8','3.7'];
+const SECTIONS = [
+  ['image','Image (Dockerfile)','image'],
+  ['compose','Compose','compose'],
+  ['volumes','Volumes','volumes'],
+  ['networks','Networks','networks'],
+  ['environment','Environment','env'],
+];
+const FILENAMES = { dockerfile:'Dockerfile', compose:'docker-compose.yml', env:'.env' };
+
+let uidCounter = 0;
+function uid(p){ return (p||'id') + '-' + (++uidCounter) + '-' + Math.random().toString(36).slice(2,8); }
+function clone(o){ return JSON.parse(JSON.stringify(o)); }
+
+function seedState(){
+  return {
+    schema:1, theme:'dark', activeSection:'image', activeTab:'dockerfile', composeVersion:'3.9',
+    docker:{ multiStage:false, stages:[{
+      id:uid('stage'), name:'', baseImage:'node:20-alpine', steps:[
+        { id:uid('step'), type:'WORKDIR', path:'/app' },
+        { id:uid('step'), type:'COPY', src:'.', dest:'.', from:'' },
+        { id:uid('step'), type:'RUN', cmd:'npm ci' },
+        { id:uid('step'), type:'CMD', cmd:'node index.js' },
+      ],
+    }]},
+    services:[{
+      id:uid('svc'), name:'app', source:'build', image:'', buildPath:'.', dockerfileName:'',
+      containerName:'', restart:'no',
+      ports:[{ host:'3000', container:'3000', proto:'' }],
+      dependsOn:[], env:[], command:'',
+      healthcheck:{ enabled:false, test:'', interval:'30s', timeout:'5s', retries:'3' },
+      volumeMounts:[{ volume:'app-data', target:'/app/data' }],
+      networks:[],
+    }],
+    volumes:[{ id:uid('vol'), name:'app-data', driver:'', driverOpts:[] }],
+    networks:[],
+    dotenv:[],
+  };
+}
+
+/* Stages actually rendered into the Dockerfile (single-stage mode = first stage only). */
+function activeStages(){ return state.docker.multiStage ? state.docker.stages : state.docker.stages.slice(0,1); }
+function stageNameOf(st, i){
+  const named = (st.name||'').trim().replace(/\s+/g,'-');
+  return (state.docker.multiStage && named) ? named : 'stage' + (i+1);
+}
+
+/* ============================================================= 2. state store ========= */
+let state = null;
+let storageBroken = false;
+
+function loadState(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw){
+      const parsed = JSON.parse(raw);
+      const norm = normalizeState(parsed);
+      if (norm) return norm;
+    }
+  }catch(e){ /* corrupt or unavailable → seed */ }
+  return null;
+}
+function saveState(){
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+  catch(e){
+    storageBroken = true;
+    toast('localStorage unavailable — this session runs memory-only','warn');
+  }
+}
+/* Structural sanity check; returns normalized state or null (→ caller falls back to seed). */
+function normalizeState(st){
+  if (!st || typeof st!=='object') return null;
+  if (st.schema!==1) return null;
+  const d = st.docker, need = d && Array.isArray(d.stages) && Array.isArray(st.services)
+    && Array.isArray(st.volumes) && Array.isArray(st.networks) && Array.isArray(st.dotenv);
+  if (!need) return null;
+  st.theme = st.theme==='light' ? 'light' : 'dark';
+  st.activeSection = SECTIONS.some(s=>s[0]===st.activeSection) ? st.activeSection : 'image';
+  st.activeTab = ['dockerfile','compose','env'].includes(st.activeTab) ? st.activeTab : 'dockerfile';
+  st.composeVersion = typeof st.composeVersion==='string' ? st.composeVersion : '3.9';
+  d.multiStage = !!d.multiStage;
+  d.stages.forEach(sg=>{
+    sg.id=sg.id||uid('stage'); sg.name=sg.name||''; sg.baseImage=sg.baseImage||'';
+    sg.steps=Array.isArray(sg.steps)?sg.steps:[];
+    sg.steps.forEach(sp=>{
+      sp.id=sp.id||uid('step');
+      if (!STEP_TYPES.includes(sp.type)) sp.type='RUN';
+      if (sp.type==='ENV' && !Array.isArray(sp.env)) sp.env=[{key:'',value:''}];
+    });
+  });
+  st.services.forEach(sv=>{
+    sv.id=sv.id||uid('svc'); sv.name=sv.name||'';
+    sv.source = sv.source==='image' ? 'image' : 'build';
+    sv.image=sv.image||''; sv.buildPath=sv.buildPath||''; sv.dockerfileName=sv.dockerfileName||'';
+    sv.containerName=sv.containerName||'';
+    if (!RESTARTS.includes(sv.restart)) sv.restart='no';
+    sv.ports=Array.isArray(sv.ports)?sv.ports:[];
+    sv.dependsOn=Array.isArray(sv.dependsOn)?sv.dependsOn:[];
+    sv.env=Array.isArray(sv.env)?sv.env:[];
+    sv.command=sv.command||'';
+    if (!sv.healthcheck || typeof sv.healthcheck!=='object') sv.healthcheck={enabled:false,test:'',interval:'30s',timeout:'5s',retries:'3'};
+    sv.healthcheck.enabled=!!sv.healthcheck.enabled;
+    sv.healthcheck.test=sv.healthcheck.test||''; sv.healthcheck.interval=sv.healthcheck.interval||'30s';
+    sv.healthcheck.timeout=sv.healthcheck.timeout||'5s'; sv.healthcheck.retries=sv.healthcheck.retries||'3';
+    sv.volumeMounts=Array.isArray(sv.volumeMounts)?sv.volumeMounts:[];
+    sv.networks=Array.isArray(sv.networks)?sv.networks:[];
+  });
+  st.volumes.forEach(v=>{ v.id=v.id||uid('vol'); v.name=v.name||''; v.driver=v.driver||''; v.driverOpts=Array.isArray(v.driverOpts)?v.driverOpts:[]; });
+  st.networks.forEach(n=>{ n.id=n.id||uid('net'); n.name=n.name||''; n.driver=n.driver||''; n.subnet=n.subnet||''; });
+  st.dotenv.forEach(r=>{ r.id=r.id||uid('kv'); r.key=r.key||''; r.value=r.value==null?'':r.value; });
+  return st;
+}
+
+/* ============================================================= 3. DOM helpers ========= */
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function h(tag, attrs, kids){
+  const el = document.createElement(tag);
+  if (attrs) for (const k of Object.keys(attrs)){
+    const v = attrs[k];
+    if (k==='value'){ el.value = v; continue; }   /* '' is meaningful (e.g. "Omit") */
+    if (v===null || v===undefined || v===false || v==='') continue;
+    if (k==='class') el.className = v;
+    else if (k==='html') el.innerHTML = v;           // trusted: generator output / icon paths
+    else if (k==='value') el.value = v;
+    else if (v===true) el.setAttribute(k,'');
+    else el.setAttribute(k,String(v));
+  }
+  if (kids){
+    const list = Array.isArray(kids) ? kids : [kids];
+    for (const kid of list){
+      if (kid===null || kid===undefined || kid===false) continue;
+      el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+    }
+  }
+  return el;
+}
+function debounce(fn, ms){
+  let t = null;
+  return function(...a){ clearTimeout(t); t = setTimeout(()=>fn.apply(this,a), ms); };
+}
+const ICONS = {
+  image:'<rect x="1.5" y="6" width="13" height="7.5" rx="1.5"/><path d="M4.5 6V3.5h3V6M8 6V4h3v2"/>',
+  compose:'<path d="M8 2.2 14 5.2 8 8.2 2 5.2Z"/><path d="M2 8.2 8 11.2l6-3"/><path d="M2 11.2 8 14.2l6-3"/>',
+  volumes:'<ellipse cx="8" cy="3.8" rx="5.5" ry="2"/><path d="M2.5 3.8v8.4c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V3.8"/><path d="M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/>',
+  networks:'<circle cx="8" cy="3.2" r="1.8"/><circle cx="3" cy="12.2" r="1.8"/><circle cx="13" cy="12.2" r="1.8"/><path d="M8 5v3.2M6.6 9.4 4 11M9.4 9.4 12 11"/>',
+  env:'<path d="M6 2h-.8C4 2 3.6 2.6 3.6 3.6v1.2C3.6 6 3 6.4 2.2 6.9c.8.5 1.4.9 1.4 2.1v1.4c0 1 .4 1.6 1.6 1.6H6"/><path d="M10 2h.8c1.2 0 1.6.6 1.6 1.6v1.2c0 1.2.6 1.6 1.4 2.1-.8.5-1.4.9-1.4 2.1v1.4c0 1-.4 1.6-1.6 1.6H10"/>',
+  sun:'<circle cx="8" cy="8" r="3"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"/>',
+  moon:'<path d="M13.5 9.6A6 6 0 1 1 6.4 2.5a5 5 0 0 0 7.1 7.1Z"/>',
+  plus:'<path d="M8 3.5v9M3.5 8h9"/>',
+  trash:'<path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.8 4.5 5.5 13h5l.7-8.5"/>',
+  reset:'<path d="M13 8A5 5 0 1 1 11.6 4.6"/><path d="M13.5 2.5v2.6h-2.6"/>',
+  up:'<path d="M4 10l4-4 4 4"/>',
+  down:'<path d="M4 6l4 4 4-4"/>',
+  run:'<path d="M5 3.5v9l7-4.5Z"/>',
+  warn:'<path d="M8 2.5 14.5 13.5h-13Z"/><path d="M8 6.5v3.2M8 12v.01"/>',
+};
+function icon(name){
+  if (!ICONS[name]) return null;
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('viewBox','0 0 16 16');
+  svg.setAttribute('class','icon');
+  svg.setAttribute('aria-hidden','true');
+  svg.innerHTML = ICONS[name];
+  return svg;
+}
+function hint(text){ return h('p',{class:'hint'},text); }
+function field(labelText, inputEl){
+  return h('label',{class:'field'},[h('span',{class:'field-name'},labelText), inputEl]);
+}
+function btn(action, cls, label, extra){
+  const b = h('button', Object.assign({type:'button','data-action':action,class:cls||'btn'}, extra||{}));
+  if (label !== undefined) b.append(label);
+  return b;
+}
+const $ = id => document.getElementById(id);
+
+/* ============================================================= 4. renderers ========== */
+let focusRestore = null;
+
+function applyTheme(theme){
+  state.theme = theme==='light' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', state.theme);
+  const b = $('btn-theme');
+  if (b){
+    b.replaceChildren(icon(state.theme==='dark'?'sun':'moon'), ' ' + (state.theme==='dark'?'Light':'Dark'));
+    b.setAttribute('aria-label', state.theme==='dark' ? 'Switch to light theme' : 'Switch to dark theme');
+  }
+}
+function renderSidebar(){
+  const nav = $('sidebar');
+  nav.replaceChildren();
+  SECTIONS.forEach(([key, label, ic])=>{
+    const on = state.activeSection===key;
+    const b = btn('nav','nav-btn',[icon(ic), label],{'data-section':key});
+    if (on) b.setAttribute('aria-current','page');
+    nav.append(b);
+  });
+}
+function renderSection(){
+  const host = $('form-panel');
+  const build = { image:buildImage, compose:buildCompose, volumes:buildVolumes, networks:buildNetworks, environment:buildEnvironment }[state.activeSection];
+  host.replaceChildren(build());
+  renderSidebar();
+}
+function captureFocus(){
+  const ae = document.activeElement;
+  focusRestore = (ae && ae.dataset && ae.dataset.f)
+    ? { key: ae.dataset.f, s: typeof ae.selectionStart==='number'?ae.selectionStart:null, e: typeof ae.selectionEnd==='number'?ae.selectionEnd:null }
+    : null;
+}
+function restoreFocus(){
+  if (!focusRestore) return;
+  const el = document.querySelector('[data-f="'+CSS.escape(focusRestore.key)+'"]');
+  if (el){
+    try{ el.focus(); }catch(e){}
+    if (focusRestore.s!=null && el.selectionStart!=null){
+      try{ el.setSelectionRange(focusRestore.s, focusRestore.e); }catch(e){}
+    }
+  }
+  focusRestore = null;
+}
+function structuralUpdate(){
+  captureFocus();
+  saveState();
+  renderSection();
+  renderPreview();
+  restoreFocus();
+}
+
+/* ---------- Image (Dockerfile) ---------- */
+function buildImage(){
+  const d = state.docker;
+  const wrap = h('section',{});
+  wrap.append(h('h2',{class:'sect-h'},[icon('image'),'Image — Dockerfile']));
+  wrap.append(h('label',{class:'toggle'},[
+    h('input',{type:'checkbox','data-f':'docker.multiStage','data-struct':'1',checked:d.multiStage||null}),
+    h('span',{},'Multi-stage build'),
+  ]));
+  wrap.append(hint('Build in one stage, or add build stages (deps, builder…) and a final runtime stage.'));
+
+  const idxs = d.multiStage ? d.stages.map((_,i)=>i) : [0];
+  const list = h('div',{});
+  idxs.forEach((si, n)=> list.append(buildStage(d.stages[si], si, d.multiStage ? n+1 : 1, d.multiStage)));
+  wrap.append(list);
+  if (d.multiStage){
+    wrap.append(btn('add-stage','btn btn-ghost',[icon('plus'),' Add stage']));
+  }
+  return wrap;
+}
+function buildStage(st, si, n, multi){
+  const fs = h('fieldset',{class:'stage'});
+  fs.append(h('legend',{}, multi ? 'Stage '+n : 'Main stage'));
+  if (multi){
+    fs.append(h('div',{class:'flds'},[
+      field('Stage name (AS name)', h('input',{'data-f':'docker.stages.'+si+'.name',value:st.name||'',placeholder:'deps / runtime / builder'})),
+      field('Base image', h('input',{list:'dl-images','data-f':'docker.stages.'+si+'.baseImage',value:st.baseImage||'',placeholder:'node:20-alpine'})),
+    ]));
+  } else {
+    fs.append(h('div',{class:'flds'},[
+      field('Base image', h('input',{list:'dl-images','data-f':'docker.stages.'+si+'.baseImage',value:st.baseImage||'',placeholder:'node:20-alpine'})),
+    ]));
+    fs.append(hint('Pick a common image from the list or type any base image.'));
+  }
+  const steps = h('div',{});
+  st.steps.forEach((sp, i)=> steps.append(buildStep(sp, si, i)));
+  fs.append(steps);
+  fs.append(btn('add-step','btn btn-ghost btn-sm',[icon('plus'),' Add step'],{'data-stage':si}));
+  const d = state.docker;
+  if (multi && d.stages.length>1){
+    fs.append(btn('del-stage','btn btn-danger btn-sm',[icon('trash'),' Remove stage'],{'data-idx':si,style:'margin-left:8px'}));
+  }
+  return fs;
+}
+function buildStep(sp, si, i){
+  const d = state.docker;
+  const fs = h('fieldset',{class:'step draggable','data-stage':si,'data-idx':i});
+  const typeSel = h('select',{'data-f':'docker.stages.'+si+'.steps.'+i+'.type','data-struct':'1','aria-label':'Instruction type'});
+  STEP_TYPES.forEach(t=>{
+    typeSel.append(h('option',{value:t,selected:sp.type===t||null},t));
+  });
+  const head = h('div',{class:'step-head'},[
+    h('span',{class:'fs-legend'},'#'+(i+1)),
+    typeSel,
+    h('span',{style:'flex:1'}),
+    btn('move-step','btn btn-ghost btn-icon',[icon('up')],{'aria-label':'Move step up','data-stage':si,'data-idx':i,'data-dir':'up'}),
+    btn('move-step','btn btn-ghost btn-icon',[icon('down')],{'aria-label':'Move step down','data-stage':si,'data-idx':i,'data-dir':'down'}),
+    btn('del-step','btn btn-danger btn-icon',[icon('trash')],{'aria-label':'Delete step','data-stage':si,'data-idx':i}),
+  ]);
+  fs.append(head);
+  fs.append(...stepFields(sp, si, i));
+  return fs;
+}
+function stepFields(sp, si, i){
+  const p = 'docker.stages.'+si+'.steps.'+i+'.', d = state.docker;
+  const mono = {class:'mono',spellcheck:'false'};
+  const out = [];
+  switch(sp.type){
+    case 'RUN':
+      out.push(field('Command', h('input',Object.assign({},mono,{'data-f':p+'cmd',value:sp.cmd||'',placeholder:'apk add --no-cache curl'}))));
+      out.push(hint('Lines over '+WRAP_COL+' chars containing && are wrapped with \u005C continuations.'));
+      break;
+    case 'COPY': {
+      const f = h('div',{class:'flds'},[
+        field('Source paths (space-separated)', h('input',Object.assign({},mono,{'data-f':p+'src',value:sp.src||'',placeholder:'. ./src'}))),
+        field('Destination', h('input',Object.assign({},mono,{'data-f':p+'dest',value:sp.dest||'',placeholder:'/app'}))),
+      ]);
+      if (d.multiStage){
+        const sel = h('select',{'data-f':p+'from','aria-label':'Copy from stage'});
+        sel.append(h('option',{value:'',selected:!sp.from||null},'(current stage)'));
+        activeStages().forEach((st,j)=>{ if (j===si) return;
+          sel.append(h('option',{value:stageNameOf(st,j),selected:sp.from===stageNameOf(st,j)||null},stageNameOf(st,j)));
+        });
+        f.append(field('--from stage', sel));
+      }
+      out.push(f);
+      break;
+    }
+    case 'WORKDIR':
+      out.push(field('Directory', h('input',Object.assign({},mono,{'data-f':p+'path',value:sp.path||'',placeholder:'/app'}))));
+      break;
+    case 'ENV':
+      out.push(h('div',{class:'subcard'},[
+        h('div',{class:'fs-legend'},'Key / value pairs'),
+        kvRows(sp.env||[], p+'env', 'add-step-env', 'del-step-env', {'data-stage':si,'data-idx':i}),
+      ]));
+      break;
+    case 'ARG':
+      out.push(h('div',{class:'flds'},[
+        field('Name', h('input',Object.assign({},mono,{'data-f':p+'name',value:sp.name||'',placeholder:'NODE_VERSION'}))),
+        field('Default value (optional)', h('input',Object.assign({},mono,{'data-f':p+'def',value:sp.def||'',placeholder:'20'}))),
+      ]));
+      break;
+    case 'EXPOSE': {
+      const sel = h('select',{'data-f':p+'proto','aria-label':'Protocol'});
+      sel.append(h('option',{value:'',selected:!sp.proto||null},'tcp'));
+      sel.append(h('option',{value:'udp',selected:sp.proto==='udp'||null},'udp'));
+      out.push(h('div',{class:'flds'},[field('Port',h('input',{'data-f':p+'port',value:sp.port||'',inputmode:'numeric',placeholder:'8080'})), field('Protocol',sel)]));
+      break;
+    }
+    case 'USER':
+      out.push(field('User (user[:group])', h('input',Object.assign({},mono,{'data-f':p+'user',value:sp.user||'',placeholder:'node'}))));
+      break;
+    case 'CMD': case 'ENTRYPOINT':
+      out.push(field('Command', h('input',Object.assign({},mono,{'data-f':p+'cmd',value:sp.cmd||'',placeholder:'node index.js  — or ["node","index.js"]'}))));
+      out.push(hint('Text starting with [ is emitted verbatim as exec form; otherwise shell form.'));
+      break;
+    case 'HEALTHCHECK':
+      out.push(h('div',{class:'flds'},[
+        field('Test command', h('input',Object.assign({},mono,{'data-f':p+'test',value:sp.test||'',placeholder:'curl -f http://localhost || exit 1'}))),
+        field('Interval (e.g. 30s)', h('input',Object.assign({},mono,{'data-f':p+'interval',value:sp.interval||'',placeholder:'30s'}))),
+        field('Timeout (e.g. 5s)', h('input',Object.assign({},mono,{'data-f':p+'timeout',value:sp.timeout||'',placeholder:'5s'}))),
+        field('Retries', h('input',Object.assign({},mono,{'data-f':p+'retries',value:sp.retries||'',inputmode:'numeric',placeholder:'3'}))),
+      ]));
+      out.push(hint('Empty test emits HEALTHCHECK NONE.'));
+      break;
+  }
+  return out;
+}
+/* generic key/value row list used by ENV steps, service env, volume driver_opts */
+function kvRows(rows, prefix, addAction, delAction, idxAttrs){
+  const wrap = h('div',{});
+  (rows||[]).forEach((r, j)=>{
+    wrap.append(h('div',{class:'rowline'},[
+      h('input',{class:'mono',spellcheck:'false','data-f':prefix+'.'+j+'.key',value:r.key||'',placeholder:'KEY','aria-label':'Key',style:'max-width:220px'}),
+      h('input',{class:'mono',spellcheck:'false','data-f':prefix+'.'+j+'.value',value:r.value==null?'':r.value,placeholder:'value'}),
+      btn(delAction,'btn btn-danger btn-icon',[icon('trash')],Object.assign({'aria-label':'Remove row','data-row':j}, idxAttrs||{})),
+    ]));
+  });
+  wrap.append(btn(addAction,'btn btn-ghost btn-sm',[icon('plus'),' Add row'], idxAttrs||{}));
+  return wrap;
+}
+
+/* ---------- Compose ---------- */
+function buildCompose(){
+  const wrap = h('section',{});
+  wrap.append(h('h2',{class:'sect-h'},[icon('compose'),'Compose — docker-compose.yml']));
+  const vsel = h('select',{'data-f':'composeVersion','aria-label':'Compose version',style:'max-width:220px'});
+  vsel.append(h('option',{value:'',selected:!state.composeVersion||null},'Omit (recommended)'));
+  COMPOSE_VERSIONS.forEach(v=> vsel.append(h('option',{value:v,selected:state.composeVersion===v||null},'Compose '+v)));
+  wrap.append(h('div',{class:'flds'},[field('Top-level version', vsel)]));
+  wrap.append(hint('The version key is deprecated in the Compose Spec — omit it for modern Compose.'));
+
+  state.services.forEach((sv,i)=> wrap.append(buildService(sv,i)));
+  wrap.append(btn('add-service','btn btn-ghost',[icon('plus'),' Add service']));
+  return wrap;
+}
+function buildService(sv, i){
+  const p = 'services.'+i+'.';
+  const fs = h('fieldset',{class:'svc'});
+  fs.append(h('legend',{},'Service '+(i+1)));
+  const head = h('div',{class:'rowline'});
+  head.append(h('span',{style:'flex:1'}));
+  head.append(btn('remove-service','btn btn-danger btn-sm',[icon('trash'),' Remove service'],{'data-idx':i}));
+  fs.append(head);
+
+  fs.append(h('div',{class:'flds'},[
+    field('Service name', h('input',{'data-f':p+'name',value:sv.name||'',placeholder:'app'})),
+    field('Container name (optional)', h('input',{'data-f':p+'containerName',value:sv.containerName||'',placeholder:'app-server'})),
+  ]));
+
+  const srcFs = h('fieldset',{});
+  srcFs.append(h('legend',{},'Source'));
+  const radioName = 'src-'+(sv.id||i);
+  const mkRadio = (val,label)=> h('label',{class:'toggle'},[
+    h('input',{type:'radio',name:radioName,value:val,'data-f':p+'source','data-struct':'1',checked:sv.source===val||null}),
+    h('span',{},label),
+  ]);
+  srcFs.append(mkRadio('image','Image'), mkRadio('build','Build (from a Dockerfile)'));
+  fs.append(srcFs);
+
+  const srcFlds = h('div',{class:'flds'});
+  if (sv.source==='image'){
+    srcFlds.append(field('Image', h('input',{list:'dl-images','data-f':p+'image',value:sv.image||'',placeholder:'node:20-alpine'})));
+  } else {
+    srcFlds.append(
+      field('Build context path', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':p+'buildPath',value:sv.buildPath||'',placeholder:'.'}))),
+      field('Dockerfile name (optional)', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':p+'dockerfileName',value:sv.dockerfileName||'',placeholder:'Dockerfile'}))),
+    );
+  }
+  fs.append(srcFlds);
+
+  const rsel = h('select',{'data-f':p+'restart','aria-label':'Restart policy'});
+  RESTARTS.forEach(r=> rsel.append(h('option',{value:r,selected:sv.restart===r||null},r)));
+  fs.append(h('div',{class:'flds'},[field('Restart policy', rsel)]));
+
+  /* ports */
+  const pFs = h('fieldset',{});
+  pFs.append(h('legend',{},'Port mappings (host : container)'));
+  sv.ports.forEach((pt, j)=>{
+    pFs.append(h('div',{class:'rowline'},[
+      h('input',{'data-f':p+'ports.'+j+'.host',value:pt.host||'',inputmode:'numeric',placeholder:'3000','aria-label':'Host port'}),
+      h('span',{class:'tk-punct'},':'),
+      h('input',{'data-f':p+'ports.'+j+'.container',value:pt.container||'',inputmode:'numeric',placeholder:'3000','aria-label':'Container port'}),
+      portProtoSel(p+'ports.'+j+'.proto', pt.proto),
+      btn('del-port','btn btn-danger btn-icon',[icon('trash')],{'aria-label':'Remove port mapping','data-idx':i,'data-row':j}),
+    ]));
+  });
+  pFs.append(btn('add-port','btn btn-ghost btn-sm',[icon('plus'),' Add port'],{'data-idx':i}));
+  fs.append(pFs);
+
+  /* depends_on */
+  const dFs = h('fieldset',{});
+  dFs.append(h('legend',{},'Depends on'));
+  const others = state.services.map((s,idx)=>({name:(s.name||'').trim(), idx})).filter(x=>x.idx!==i && x.name);
+  if (!others.length) dFs.append(hint('Add another service to reference it here.'));
+  else others.forEach(x=>{
+    dFs.append(h('label',{class:'toggle'},[
+      h('input',{type:'checkbox','data-dep':x.name,checked:sv.dependsOn.includes(x.name)||null}),
+      h('span',{},x.name),
+    ]));
+  });
+  fs.append(dFs);
+
+  /* environment */
+  const eFs = h('fieldset',{});
+  eFs.append(h('legend',{},'Environment'));
+  eFs.append(kvRows(sv.env, p+'env','add-svc-env','del-svc-env',{'data-idx':i}));
+  eFs.append(hint('Reference keys as ${KEY} — they are defined in the Environment section. Compose reads a .env file next to the compose file.'));
+  eFs.append(btn('import-env-keys','btn btn-ghost btn-sm',[icon('plus'),' Import keys from .env'],{'data-idx':i}));
+  fs.append(eFs);
+
+  /* command */
+  fs.append(h('div',{class:'flds'},[
+    field('Command override (optional)', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':p+'command',value:sv.command||'',placeholder:'node server.js'}))),
+  ]));
+
+  /* healthcheck */
+  const hFs = h('fieldset',{});
+  hFs.append(h('legend',{},'Healthcheck'));
+  hFs.append(h('label',{class:'toggle'},[
+    h('input',{type:'checkbox','data-f':p+'healthcheck.enabled','data-struct':'1',checked:sv.healthcheck.enabled||null}),
+    h('span',{},'Enable healthcheck'),
+  ]));
+  if (sv.healthcheck.enabled){
+    hFs.append(h('div',{class:'flds'},[
+      field('Test command', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':p+'healthcheck.test',value:sv.healthcheck.test||'',placeholder:'curl -f http://localhost || exit 1'}))),
+      field('Interval', h('input',Object.assign({class:'mono'},{'data-f':p+'healthcheck.interval',value:sv.healthcheck.interval||'',placeholder:'30s'}))),
+      field('Timeout', h('input',Object.assign({class:'mono'},{'data-f':p+'healthcheck.timeout',value:sv.healthcheck.timeout||'',placeholder:'5s'}))),
+      field('Retries', h('input',Object.assign({class:'mono'},{'data-f':p+'healthcheck.retries',value:sv.healthcheck.retries||'',inputmode:'numeric',placeholder:'3'}))),
+    ]));
+  }
+  fs.append(hFs);
+
+  /* volume mounts */
+  const vFs = h('fieldset',{});
+  vFs.append(h('legend',{},'Volume mounts'));
+  const declaredVols = state.volumes.map(v=>(v.name||'').trim()).filter(Boolean);
+  if (!declaredVols.length) vFs.append(hint('Declare named volumes in the Volumes section first.'));
+  sv.volumeMounts.forEach((m, j)=>{
+    const sel = h('select',{'data-f':p+'volumeMounts.'+j+'.volume','aria-label':'Volume name'});
+    sel.append(h('option',{value:'',selected:!m.volume||null},'— select volume —'));
+    declaredVols.forEach(vn=> sel.append(h('option',{value:vn,selected:m.volume===vn||null},vn)));
+    vFs.append(h('div',{class:'rowline'},[
+      sel,
+      h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':p+'volumeMounts.'+j+'.target',value:m.target||'',placeholder:'/app/data','aria-label':'Mount target path in container'})),
+      btn('del-mount','btn btn-danger btn-icon',[icon('trash')],{'aria-label':'Remove volume mount','data-idx':i,'data-row':j}),
+    ]));
+  });
+  vFs.append(btn('add-mount','btn btn-ghost btn-sm',[icon('plus'),' Attach volume'],{'data-idx':i}));
+  fs.append(vFs);
+
+  /* networks */
+  const nFs = h('fieldset',{});
+  nFs.append(h('legend',{},'Networks'));
+  const declaredNets = state.networks.map(n=>(n.name||'').trim()).filter(Boolean);
+  if (!declaredNets.length) nFs.append(hint('Declare networks in the Networks section first.'));
+  else declaredNets.forEach(nn=>{
+    nFs.append(h('label',{class:'toggle'},[
+      h('input',{type:'checkbox','data-net':nn,checked:sv.networks.includes(nn)||null}),
+      h('span',{},nn),
+    ]));
+  });
+  fs.append(nFs);
+  return fs;
+}
+function portProtoSel(path, val){
+  const sel = h('select',{'data-f':path,'aria-label':'Protocol',style:'max-width:90px'});
+  sel.append(h('option',{value:'',selected:!val||null},'tcp'));
+  sel.append(h('option',{value:'udp',selected:val==='udp'||null},'udp'));
+  return sel;
+}
+
+/* ---------- Volumes ---------- */
+function buildVolumes(){
+  const wrap = h('section',{});
+  wrap.append(h('h2',{class:'sect-h'},[icon('volumes'),'Volumes']));
+  wrap.append(hint('Top-level named volume declarations. Mount them on services from the Compose section.'));
+  state.volumes.forEach((v,i)=>{
+    const fs = h('fieldset',{class:'vol'});
+    fs.append(h('legend',{},'Volume '+(i+1)));
+    const head = h('div',{class:'rowline'});
+    head.append(h('span',{style:'flex:1'}));
+    head.append(btn('del-volume','btn btn-danger btn-sm',[icon('trash'),' Remove volume'],{'data-idx':i}));
+    fs.append(head);
+    fs.append(h('div',{class:'flds'},[
+      field('Name', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':'volumes.'+i+'.name',value:v.name||'',placeholder:'app-data'}))),
+      field('Driver (optional)', h('input',{'data-f':'volumes.'+i+'.driver',value:v.driver||'',list:'dl-drivers',placeholder:'local'})),
+    ]));
+    fs.append(h('div',{class:'subcard'},[
+      h('div',{class:'fs-legend'},'driver_opts (optional)'),
+      kvRows(v.driverOpts,'volumes.'+i+'.driverOpts','add-vo','del-vo',{'data-idx':i}),
+    ]));
+    wrap.append(fs);
+  });
+  wrap.append(btn('add-volume','btn btn-ghost',[icon('plus'),' Add volume']));
+  return wrap;
+}
+
+/* ---------- Networks ---------- */
+function buildNetworks(){
+  const wrap = h('section',{});
+  wrap.append(h('h2',{class:'sect-h'},[icon('networks'),'Networks']));
+  wrap.append(hint('Top-level network declarations. Attach them to services from the Compose section.'));
+  state.networks.forEach((n,i)=>{
+    const fs = h('fieldset',{class:'net'});
+    fs.append(h('legend',{},'Network '+(i+1)));
+    const head = h('div',{class:'rowline'});
+    head.append(h('span',{style:'flex:1'}));
+    head.append(btn('del-network','btn btn-danger btn-sm',[icon('trash'),' Remove network'],{'data-idx':i}));
+    fs.append(head);
+    fs.append(h('div',{class:'flds'},[
+      field('Name', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':'networks.'+i+'.name',value:n.name||'',placeholder:'backend'}))),
+      field('Driver (optional)', h('input',{'data-f':'networks.'+i+'.driver',value:n.driver||'',list:'dl-drivers',placeholder:'bridge'})),
+      field('Subnet (optional, CIDR)', h('input',Object.assign({class:'mono',spellcheck:'false'},{'data-f':'networks.'+i+'.subnet',value:n.subnet||'',placeholder:'172.16.0.0/24'}))),
+    ]));
+    wrap.append(fs);
+  });
+  wrap.append(btn('add-network','btn btn-ghost',[icon('plus'),' Add network']));
+  return wrap;
+}
+
+/* ---------- Environment ---------- */
+function buildEnvironment(){
+  const wrap = h('section',{});
+  wrap.append(h('h2',{class:'sect-h'},[icon('env'),'Environment — .env']));
+  wrap.append(hint('docker compose automatically reads a .env file placed next to the compose file. Reference keys as ${KEY} in service environment values or commands.'));
+  const bannerHost = h('div',{id:'env-banner'});
+  wrap.append(bannerHost);
+  state.dotenv.forEach((r,i)=>{
+    wrap.append(h('div',{class:'rowline'},[
+      h('input',{class:'mono',spellcheck:'false','data-f':'dotenv.'+i+'.key',value:r.key||'',placeholder:'KEY','aria-label':'Key',style:'max-width:260px'}),
+      h('input',{class:'mono',spellcheck:'false','data-f':'dotenv.'+i+'.value',value:r.value==null?'':r.value,placeholder:'value'}),
+      btn('del-dotenv','btn btn-danger btn-icon',[icon('trash')],{'aria-label':'Remove key','data-row':i}),
+    ]));
+  });
+  wrap.append(btn('add-dotenv','btn btn-ghost btn-sm',[icon('plus'),' Add variable']));
+  const paste = h('fieldset',{});
+  paste.append(h('legend',{},'Paste & import .env'));
+  paste.append(h('textarea',{class:'mono',id:'env-paste',rows:6,spellcheck:'false',placeholder:'KEY=value\n# comment lines are ignored\nexport OTHER=value'}));
+  paste.append(h('div',{style:'margin-top:8px'},btn('dotenv-paste','btn btn-ghost btn-sm',[icon('plus'),' Import lines'])));
+  paste.append(hint('One KEY=value per line; “#” comments and “export ” prefixes are stripped.'));
+  wrap.append(paste);
+  return wrap;
+}
+function renderEnvBanner(){
+  const host = $('env-banner');
+  if (!host) return;
+  const miss = envUnresolvedKeys();
+  host.replaceChildren();
+  if (!miss.length) return;
+  host.append(h('div',{class:'v-banner'},[
+    icon('warn'),
+    h('span',{},'Referenced in compose but not defined in .env: '+miss.join(', ')+
+      ' — define them here or Compose will interpolate empty strings.'),
+  ]));
+}
+
+/* ============================================================= 5. actions / repeaters = */
+document.addEventListener('click', e=>{
+  const el = e.target instanceof Element ? e.target.closest('[data-action]') : null;
+  if (!el || el.disabled) return;
+  handleAction(el, e);
+});
+
+function handleAction(el, e){
+  const a = el.dataset.action;
+  switch(a){
+    case 'nav':
+      if (state.activeSection !== el.dataset.section){
+        state.activeSection = el.dataset.section;
+        saveState(); renderSection(); renderPreview();
+      }
+      break;
+    case 'theme':
+      applyTheme(state.theme==='dark' ? 'light' : 'dark');
+      saveState();
+      break;
+    case 'reset': {
+      if (!window.confirm('Reset the whole configuration to the default seed? This cannot be undone.')) break;
+      const theme = state.theme;
+      try{ localStorage.removeItem(STORAGE_KEY); }catch(err){}
+      state = seedState();
+      state.theme = theme;
+      applyTheme(theme);
+      saveState();
+      renderSection(); renderPreview();
+      toast('Configuration reset to defaults');
+      break;
+    }
+    case 'tab': {
+      const t = el.dataset.tab;
+      if (t!==state.activeTab && !$('tab-'+t).hidden){
+        state.activeTab = t;
+        saveState(); renderPreview();
+        $('tab-'+t).focus();
+      }
+      break;
+    }
+    case 'copy': copyActive(); break;
+    case 'download': downloadActive(); break;
+    case 'copy-run': copyDockerRun(); break;
+
+    case 'add-stage': {
+      captureFocus();
+      state.docker.stages.push({ id:uid('stage'), name:'', baseImage:'', steps:[{ id:uid('step'), type:'RUN', cmd:'' }] });
+      structuralUpdate(); break;
+    }
+    case 'del-stage': {
+      const i = +el.dataset.idx;
+      if (state.docker.stages.length>1){ state.docker.stages.splice(i,1); structuralUpdate(); }
+      break;
+    }
+    case 'add-step': {
+      captureFocus();
+      const st = state.docker.stages[+el.dataset.stage];
+      st.steps.push({ id:uid('step'), type:'RUN', cmd:'' });
+      structuralUpdate(); break;
+    }
+    case 'del-step': {
+      const st = state.docker.stages[+el.dataset.stage];
+      st.steps.splice(+el.dataset.idx,1);
+      structuralUpdate(); break;
+    }
+    case 'move-step': {
+      const s = +el.dataset.stage, i = +el.dataset.idx, dir = el.dataset.dir;
+      const st = state.docker.stages[s];
+      const j = dir==='up' ? i-1 : i+1;
+      if (j<0 || j>=st.steps.length) break;
+      const [m] = st.steps.splice(i,1);
+      st.steps.splice(j,0,m);
+      structuralUpdate();
+      const nb = document.querySelector('.step[data-stage="'+s+'"][data-idx="'+j+'"] button[data-dir="'+dir+'"]');
+      if (nb) nb.focus();
+      break;
+    }
+    case 'add-step-env': {
+      captureFocus();
+      const sp = state.docker.stages[+el.dataset.stage].steps[+el.dataset.idx];
+      sp.env = Array.isArray(sp.env)?sp.env:[];
+      sp.env.push({key:'',value:''});
+      structuralUpdate(); break;
+    }
+    case 'del-step-env': {
+      const sp = state.docker.stages[+el.dataset.stage].steps[+el.dataset.idx];
+      sp.env.splice(+el.dataset.row,1);
+      structuralUpdate(); break;
+    }
+
+    case 'add-service': {
+      captureFocus();
+      state.services.push({ id:uid('svc'), name:'', source:'image', image:'', buildPath:'.', dockerfileName:'',
+        containerName:'', restart:'no', ports:[], dependsOn:[], env:[], command:'',
+        healthcheck:{enabled:false,test:'',interval:'30s',timeout:'5s',retries:'3'}, volumeMounts:[], networks:[] });
+      structuralUpdate();
+      toast('Service added');
+      break;
+    }
+    case 'remove-service': removeServiceCascade(+el.dataset.idx); break;
+    case 'add-port': {
+      captureFocus();
+      state.services[+el.dataset.idx].ports.push({host:'',container:'',proto:''});
+      structuralUpdate(); break;
+    }
+    case 'del-port': {
+      const sv = state.services[+el.dataset.idx];
+      sv.ports.splice(+el.dataset.row,1);
+      structuralUpdate(); break;
+    }
+    case 'add-svc-env': {
+      captureFocus();
+      state.services[+el.dataset.idx].env.push({key:'',value:''});
+      structuralUpdate(); break;
+    }
+    case 'del-svc-env': {
+      const sv = state.services[+el.dataset.idx];
+      sv.env.splice(+el.dataset.row,1);
+      structuralUpdate(); break;
+    }
+    case 'import-env-keys': {
+      const sv = state.services[+el.dataset.idx];
+      const keys = state.dotenv.map(r=>(r.key||'').trim()).filter(Boolean);
+      if (!keys.length){ toast('No keys defined in the .env editor yet','warn'); break; }
+      const have = new Set(sv.env.map(r=>(r.key||'').trim()).filter(Boolean));
+      const added = keys.filter(k=>!have.has(k));
+      if (!added.length){ toast('All .env keys are already present','warn'); break; }
+      captureFocus();
+      added.forEach(k=> sv.env.push({key:k, value:''}));
+      structuralUpdate();
+      toast('Imported '+added.length+' key'+(added.length===1?'':'s')+' from .env');
+      break;
+    }
+    case 'add-mount': {
+      captureFocus();
+      state.services[+el.dataset.idx].volumeMounts.push({volume:'',target:''});
+      structuralUpdate(); break;
+    }
+    case 'del-mount': {
+      const sv = state.services[+el.dataset.idx];
+      sv.volumeMounts.splice(+el.dataset.row,1);
+      structuralUpdate(); break;
+    }
+
+    case 'add-volume': {
+      captureFocus();
+      state.volumes.push({ id:uid('vol'), name:'', driver:'', driverOpts:[] });
+      structuralUpdate(); break;
+    }
+    case 'del-volume': {
+      state.volumes.splice(+el.dataset.idx,1);
+      structuralUpdate(); break;
+    }
+    case 'add-vo': {
+      captureFocus();
+      state.volumes[+el.dataset.idx].driverOpts.push({key:'',value:''});
+      structuralUpdate(); break;
+    }
+    case 'del-vo': {
+      state.volumes[+el.dataset.idx].driverOpts.splice(+el.dataset.row,1);
+      structuralUpdate(); break;
+    }
+
+    case 'add-network': {
+      captureFocus();
+      state.networks.push({ id:uid('net'), name:'', driver:'', subnet:'' });
+      structuralUpdate(); break;
+    }
+    case 'del-network': {
+      state.networks.splice(+el.dataset.idx,1);
+      structuralUpdate(); break;
+    }
+
+    case 'add-dotenv': {
+      captureFocus();
+      state.dotenv.push({ id:uid('kv'), key:'', value:'' });
+      structuralUpdate(); break;
+    }
+    case 'del-dotenv': {
+      state.dotenv.splice(+el.dataset.row,1);
+      structuralUpdate(); break;
+    }
+    case 'dotenv-paste': {
+      const ta = $('env-paste');
+      const rows = parseDotenv(ta ? ta.value : '');
+      if (!rows.length){ toast('Nothing to import — expected KEY=value lines','warn'); break; }
+      captureFocus();
+      let added=0, updated=0;
+      rows.forEach(r=>{
+        const ex = state.dotenv.find(x=>(x.key||'').trim()===r.key);
+        if (ex){ ex.value=r.value; updated++; }
+        else { state.dotenv.push({id:uid('kv'),key:r.key,value:r.value}); added++; }
+      });
+      ta.value='';
+      structuralUpdate();
+      toast('Imported '+added+' new key'+(added===1?'':'s')+(updated?' ('+updated+' value'+(updated===1?'':'s')+' updated)':''));
+      break;
+    }
+
+    case 'toast-dismiss': {
+      const t = el.closest('.toast'); if (t) t.remove();
+      break;
+    }
+  }
+}
+
+/* Service deletion cascade — rubs the name out of depends_on lists and drops
+   top-level volumes / networks that ONLY this service used. One atomic mutation. */
+function removeServiceCascade(idx){
+  const sv = state.services[idx];
+  const name = (sv.name||'').trim();
+  const wasVols = sv.volumeMounts.map(m=>m.volume);
+  const wasNets = sv.networks.slice();
+  state.services.splice(idx,1);
+
+  let scrubbed = 0;
+  state.services.forEach(o=>{
+    if (o.dependsOn.includes(name)){ o.dependsOn = o.dependsOn.filter(d=>d!==name); scrubbed++; }
+  });
+  const usedVols = new Set(state.services.flatMap(o=>o.volumeMounts.map(m=>m.volume)));
+  const usedNets = new Set(state.services.flatMap(o=>o.networks));
+  const droppedVols=[], droppedNets=[];
+  state.volumes = state.volumes.filter(v=>{
+    if (wasVols.includes(v.name) && !usedVols.has(v.name)){ droppedVols.push(v.name); return false; }
+    return true;
+  });
+  state.networks = state.networks.filter(n=>{
+    if (wasNets.includes(n.name) && !usedNets.has(n.name)){ droppedNets.push(n.name); return false; }
+    return true;
+  });
+
+  structuralUpdate();
+  const clauses = [];
+  if (scrubbed) clauses.push('scrubbed from '+scrubbed+' depends_on list'+(scrubbed===1?'':'s'));
+  if (droppedVols.length) clauses.push('dropped volume'+(droppedVols.length===1?'':'s')+' '+droppedVols.join(', '));
+  if (droppedNets.length) clauses.push('dropped network'+(droppedNets.length===1?'':'s')+' '+droppedNets.join(', '));
+  toast('Removed service “'+(name||'unnamed')+'”'+(clauses.length?' · '+clauses.join(' · '):''));
+}
+
+/* ---------- HTML5 drag-to-reorder (steps) ---------- */
+let dragCtx = null;
+document.addEventListener('dragstart', e=>{
+  const row = e.target instanceof Element ? e.target.closest('.draggable') : null;
+  if (!row || row.dataset.stage===undefined) return;
+  dragCtx = { stage:+row.dataset.stage, idx:+row.dataset.idx };
+  try{ e.dataTransfer.setData('text/plain', String(dragCtx.idx)); e.dataTransfer.effectAllowed='move'; }catch(err){}
+  row.classList.add('dragging');
+});
+document.addEventListener('dragover', e=>{
+  if (!dragCtx) return;
+  const row = e.target instanceof Element ? e.target.closest('.draggable') : null;
+  if (!row || !row.dataset.stage || +row.dataset.stage!==dragCtx.stage) return;
+  e.preventDefault();
+  try{ e.dataTransfer.dropEffect='move'; }catch(err){}
+  document.querySelectorAll('.drop-target').forEach(x=>x.classList.remove('drop-target'));
+  row.classList.add('drop-target');
+});
+document.addEventListener('drop', e=>{
+  if (!dragCtx) return;
+  e.preventDefault();
+  const row = e.target instanceof Element ? e.target.closest('.draggable') : null;
+  if (row && row.dataset.stage!==undefined && +row.dataset.stage===dragCtx.stage){
+    const target = +row.dataset.idx;
+    if (target!==dragCtx.idx){
+      const st = state.docker.stages[dragCtx.stage];
+      const [m] = st.steps.splice(dragCtx.idx,1);
+      st.steps.splice(target,0,m);
+      structuralUpdate();
+    }
+  }
+});
+document.addEventListener('dragend', ()=>{
+  dragCtx = null;
+  document.querySelectorAll('.drop-target').forEach(x=>x.classList.remove('drop-target'));
+  document.querySelectorAll('.dragging').forEach(x=>x.classList.remove('dragging'));
+});
+
+/* ============================================================= 6. generators ========== */
+const YAML_RESERVED = /^(yes|no|on|off|true|false|null|~)$/i;
+function needsYamlQuote(v){
+  v = String(v);
+  if (v==='') return true;
+  if (v.includes(':') || v.includes('#') || v.includes('${')) return true;  // per spec: quote values containing : or #
+  if (/^[\s\-?:,&*!|>'"%@`\{\}\[\]]/.test(v)) return true;
+  if (/\s$/.test(v)) return true;
+  if (/^0\d/.test(v)) return true;                    // leading zeros: 007
+  if (YAML_RESERVED.test(v)) return true;
+  const t = v.trim();
+  if (t && t===v && !Number.isNaN(Number(t)) && Number.isFinite(Number(t))) return true; // parses as number
+  return false;
+}
+function yamlScalar(v){
+  v = String(v==null ? '' : v);
+  if (v.includes('\n') || v.includes('\r') || v.includes('\t') || v.includes('\\')){
+    return '"' + v.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r').replace(/\t/g,'\\t') + '"';
+  }
+  if (needsYamlQuote(v)) return "'" + v.replace(/'/g,"''") + "'";
+  return v;
+}
+const yamlKey = yamlScalar;
+
+/* RUN chain wrapping: break before each subsequent && when the line exceeds WRAP_COL. */
+function wrapRunLines(line){
+  if (line.length<=WRAP_COL || !line.includes('&&')) return [line];
+  const parts = line.split('&&').map(s=>s.trim()).filter(Boolean);
+  if (parts.length<2) return [line];
+  const out = [parts[0]+' \\'];
+  for (let i=1;i<parts.length;i++){
+    out.push('    && '+parts[i]+(i===parts.length-1?'':' \\'));
+  }
+  return out;
+}
+function dockerEnvVal(v){
+  v = String(v==null?'':v);
+  if (v==='') return '""';
+  if (/[\s"'#]/.test(v)) return '"'+v.replace(/(["\\])/g,'\\$1')+'"';
+  return v;
+}
+function genDockerfile(){
+  const L=[];
+  const stages = activeStages();
+  stages.forEach((st,i)=>{
+    const base = (st.baseImage||'').trim();
+    L.push('FROM '+(base||'<base-image>')+(state.docker.multiStage ? ' AS '+stageNameOf(st,i) : ''));
+    st.steps.forEach(sp=>{
+      switch(sp.type){
+        case 'RUN': {
+          const cmd=(sp.cmd||'').trim();
+          if (cmd) wrapRunLines('RUN '+cmd).forEach(l=>L.push(l));
+          break;
+        }
+        case 'COPY': {
+          const srcs=(sp.src||'').trim().split(/\s+/).filter(Boolean);
+          const dest=(sp.dest||'').trim();
+          const parts=['COPY'];
+          if (state.docker.multiStage && (sp.from||'').trim()) parts.push('--from='+sp.from.trim());
+          parts.push(...srcs);
+          if (dest||srcs.length) parts.push(dest);
+          if (parts.length>1) L.push(parts.join(' '));
+          break;
+        }
+        case 'WORKDIR': {
+          const p=(sp.path||'').trim();
+          if (p) L.push('WORKDIR '+p);
+          break;
+        }
+        case 'ENV':
+          (Array.isArray(sp.env)?sp.env:[]).forEach(r=>{
+            const k=(r.key||'').trim();
+            if (k) L.push('ENV '+k+'='+dockerEnvVal(r.value));
+          });
+          break;
+        case 'ARG': {
+          const n=(sp.name||'').trim();
+          if (n) L.push('ARG '+n+((sp.def||'')!==''?'='+sp.def:''));
+          break;
+        }
+        case 'EXPOSE': {
+          const pt=(sp.port||'').trim();
+          if (pt) L.push('EXPOSE '+pt+(sp.proto==='udp'?'/udp':''));
+          break;
+        }
+        case 'USER': {
+          const u=(sp.user||'').trim();
+          if (u) L.push('USER '+u);
+          break;
+        }
+        case 'CMD': case 'ENTRYPOINT': {
+          const c=(sp.cmd||'').trim();
+          if (c) L.push(sp.type+' '+c);
+          break;
+        }
+        case 'HEALTHCHECK': {
+          const t=(sp.test||'').trim();
+          const flags=[];
+          if ((sp.interval||'').trim()) flags.push('--interval='+sp.interval.trim());
+          if ((sp.timeout||'').trim()) flags.push('--timeout='+sp.timeout.trim());
+          if ((sp.retries||'').trim()) flags.push('--retries='+sp.retries.trim());
+          if (!t){ L.push('HEALTHCHECK NONE'); }
+          else L.push('HEALTHCHECK '+(flags.length?flags.join(' ')+' ':'')+'CMD '+t);
+          break;
+        }
+      }
+    });
+    if (i<stages.length-1) L.push('');
+  });
+  return L.join('\n')+'\n';
+}
+function genCompose(){
+  const L=[];
+  const q = yamlScalar;
+  if (state.composeVersion) L.push('version: '+q(state.composeVersion));
+  if (!state.services.length){ L.push('services: {}'); return L.join('\n')+'\n'; }
+  L.push('services:');
+  state.services.forEach(sv=>{
+    L.push('  '+yamlKey(sv.name||'')+':');
+    if (sv.source==='build'){
+      if ((sv.dockerfileName||'').trim()){
+        L.push('    build:');
+        L.push('      context: '+q(sv.buildPath||''));
+        L.push('      dockerfile: '+q(sv.dockerfileName.trim()));
+      } else {
+        L.push('    build: '+q(sv.buildPath||''));
+      }
+    } else {
+      L.push('    image: '+q(sv.image||''));
+    }
+    if ((sv.containerName||'').trim()) L.push('    container_name: '+q(sv.containerName.trim()));
+    L.push('    restart: '+q(sv.restart||'no'));
+    const portRows = sv.ports
+      .filter(pt=>(pt.host||'').trim()||(pt.container||'').trim())
+      .map(pt=>(pt.host||'')+':'+(pt.container||'')+((pt.proto||'')==='udp'?'/udp':''));
+    if (portRows.length){
+      L.push('    ports:');
+      portRows.forEach(s=>L.push('      - '+q(s)));
+    }
+    const envRows = sv.env.filter(r=>(r.key||'').trim());
+    if (envRows.length){
+      L.push('    environment:');
+      envRows.forEach(r=>L.push('      '+yamlKey(r.key.trim())+': '+q(r.value==null?'':r.value)));
+    }
+    if ((sv.command||'').trim()) L.push('    command: '+q(sv.command.trim()));
+    const deps = sv.dependsOn.filter(d=>(d||'').trim());
+    if (deps.length){
+      L.push('    depends_on:');
+      deps.forEach(d=>L.push('      - '+q(d)));
+    }
+    if (sv.healthcheck && sv.healthcheck.enabled && (sv.healthcheck.test||'').trim()){
+      L.push('    healthcheck:');
+      L.push('      test: ['+q('CMD-SHELL')+', '+q(sv.healthcheck.test.trim())+']');
+      if ((sv.healthcheck.interval||'').trim()) L.push('      interval: '+q(sv.healthcheck.interval.trim()));
+      if ((sv.healthcheck.timeout||'').trim()) L.push('      timeout: '+q(sv.healthcheck.timeout.trim()));
+      if ((sv.healthcheck.retries||'').trim()){
+        const r = sv.healthcheck.retries.trim();
+        L.push('      retries: '+( /^\d+$/.test(r)?r:q(r)));
+      }
+    }
+    const mounts = sv.volumeMounts.filter(m=>(m.volume||'').trim()&&(m.target||'').trim());
+    if (mounts.length){
+      L.push('    volumes:');
+      mounts.forEach(m=>L.push('      - '+q(m.volume.trim()+':'+m.target.trim())));
+    }
+    const nets = sv.networks.filter(n=>(n||'').trim());
+    if (nets.length){
+      L.push('    networks:');
+      nets.forEach(n=>L.push('      - '+q(n)));
+    }
+  });
+  const vols = state.volumes.filter(v=>(v.name||'').trim());
+  if (vols.length){
+    L.push('volumes:');
+    vols.forEach(v=>{
+      const opts = v.driverOpts.filter(o=>(o.key||'').trim());
+      if (!(v.driver||'').trim() && !opts.length){ L.push('  '+yamlKey(v.name.trim())+': {}'); return; }
+      L.push('  '+yamlKey(v.name.trim())+':');
+      if ((v.driver||'').trim()) L.push('    driver: '+q(v.driver.trim()));
+      if (opts.length){
+        L.push('    driver_opts:');
+        opts.forEach(o=>L.push('      '+yamlKey(o.key.trim())+': '+q(o.value==null?'':o.value)));
+      }
+    });
+  }
+  const nets = state.networks.filter(n=>(n.name||'').trim());
+  if (nets.length){
+    L.push('networks:');
+    nets.forEach(n=>{
+      const hasDriver=(n.driver||'').trim(), hasSubnet=(n.subnet||'').trim();
+      if (!hasDriver && !hasSubnet){ L.push('  '+yamlKey(n.name.trim())+': {}'); return; }
+      L.push('  '+yamlKey(n.name.trim())+':');
+      if (hasDriver) L.push('    driver: '+q(n.driver.trim()));
+      if (hasSubnet){
+        L.push('    ipam:');
+        L.push('      config:');
+        L.push('        - subnet: '+q(n.subnet.trim()));
+      }
+    });
+  }
+  return L.join('\n')+'\n';
+}
+function genEnv(){
+  const rows = state.dotenv.filter(r=>(r.key||'').trim());
+  if (!rows.length) return '';
+  const L = ['# generated by docker-ui'];
+  rows.forEach(r=>{
+    L.push(r.key.trim()+'='+String(r.value==null?'':r.value).replace(/[\r\n]+/g,' '));
+  });
+  return L.join('\n')+'\n';
+}
+function parseDotenv(text){
+  const out=[];
+  String(text||'').split(/\r?\n/).forEach(line=>{
+    const t=line.trim();
+    if (!t || t.startsWith('#')) return;
+    const m=t.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/);
+    if (m) out.push({key:m[1], value:m[2].replace(/^["'](.*)["']$/,'$1')});
+  });
+  return out;
+}
+
+/* ============================================================= 7. validation ========== */
+function collectEnvRefs(){
+  const used = new Set();
+  const scan = s => { if (!s) return; for (const m of String(s).matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) used.add(m[1]); };
+  state.services.forEach(sv=>{
+    scan(sv.command);
+    sv.env.forEach(r=>scan(r.value));
+  });
+  return used;
+}
+function envUnresolvedKeys(){
+  const used = collectEnvRefs();
+  const defined = new Set(state.dotenv.map(r=>(r.key||'').trim()).filter(Boolean));
+  return [...used].filter(k=>!defined.has(k)).sort();
+}
+function validName(n){ return /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(n||''); }
+function validateAll(){
+  const errors=[], warnings=[];
+  const stages = activeStages();
+
+  stages.forEach((st,i)=>{
+    if (!(st.baseImage||'').trim()) errors.push('Image · stage '+(i+1)+': base image is required');
+  });
+  if (state.docker.multiStage){
+    const names = stages.map((st,i)=>stageNameOf(st,i));
+    const seen = new Set();
+    names.forEach(n=>{
+      if (seen.has(n)) errors.push('Image · duplicate stage name “'+n+'”');
+      seen.add(n);
+    });
+  }
+
+  if (!state.services.length) errors.push('Compose · at least one service is required');
+  const svcNames = state.services.map(s=>(s.name||'').trim());
+  const dupSvc = svcNames.filter((n,i)=>n && svcNames.indexOf(n)!==i);
+  [...new Set(dupSvc)].forEach(n=>errors.push('Compose · duplicate service name “'+n+'”'));
+
+  state.services.forEach(sv=>{
+    const nm = (sv.name||'').trim() || '(unnamed)';
+    const pre = 'Service “'+nm+'”';
+    if (!validName(sv.name||'')) errors.push(pre+' · invalid service name (use letters, digits, “_ . -”, starting with a letter or digit)');
+    if (sv.source==='build'){
+      if (!(sv.buildPath||'').trim()) errors.push(pre+' · build context path is required');
+    } else {
+      if (!(sv.image||'').trim()) errors.push(pre+' · image is required (or switch the source to build)');
+    }
+    sv.ports.forEach((pt,j)=>{
+      const h1=(pt.host||'').trim(), c1=(pt.container||'').trim();
+      if (!h1 && !c1) return;
+      if (!/^\d+$/.test(h1) || !/^\d+$/.test(c1)) errors.push(pre+' · port '+(j+1)+': host and container must be digits (format \\d+:\\d+)');
+    });
+    sv.dependsOn.forEach(d=>{
+      if (d===nm) errors.push(pre+' · a service cannot depend on itself');
+      else if (!svcNames.includes(d)) errors.push(pre+' · depends_on references unknown service “'+d+'”');
+    });
+    sv.networks.forEach(n=>{
+      if (!state.networks.some(x=>(x.name||'').trim()===n)) errors.push(pre+' · network “'+n+'” is not declared');
+    });
+    sv.volumeMounts.forEach(m=>{
+      if (!(m.volume||'').trim()) return;
+      if (!state.volumes.some(x=>(x.name||'').trim()===m.volume)) errors.push(pre+' · volume “'+m.volume+'” is not declared');
+      if (!(m.target||'').trim()) errors.push(pre+' · volume “'+m.volume+'” needs a container target path');
+    });
+  });
+
+  const volNames = state.volumes.map(v=>(v.name||'').trim());
+  const dupVol = volNames.filter((n,i)=>n && volNames.indexOf(n)!==i);
+  [...new Set(dupVol)].forEach(n=>errors.push('Volumes · duplicate volume name “'+n+'”'));
+  state.volumes.forEach(v=>{
+    if (!validName(v.name)) errors.push('Volumes · invalid volume name “'+(v.name||'')+'”');
+  });
+  const netNames = state.networks.map(n=>(n.name||'').trim());
+  const dupNet = netNames.filter((n,i)=>n && netNames.indexOf(n)!==i);
+  [...new Set(dupNet)].forEach(n=>errors.push('Networks · duplicate network name “'+n+'”'));
+  state.networks.forEach(n=>{
+    if (!validName(n.name)) errors.push('Networks · invalid network name “'+(n.name||'')+'”');
+    const sub=(n.subnet||'').trim();
+    if (sub && !isCidr(sub)) errors.push('Networks · subnet of “'+n.name+'” must be CIDR like 172.16.0.0/24');
+  });
+
+  const missing = envUnresolvedKeys();
+  if (missing.length) warnings.push('.env · referenced but not defined: '+missing.map(k=>'${'+k+'}').join(', '));
+  if (state.composeVersion) warnings.push('Compose · the top-level version key is deprecated in the Compose Spec (choose “Omit (recommended)”)');
+
+  return { errors, warnings, missingEnv:missing };
+}
+function isCidr(s){
+  const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+  if (!m) return false;
+  const oct = m.slice(1,5).map(Number);
+  return oct.every(o=>o>=0&&o<=255) && +m[5]<=32;
+}
+
+/* ============================================================= 8. preview ============= */
+let outDocker='', outCompose='', outEnv='';
+const hlCache = { dockerfile:'', compose:'', env:'' };
+
+function refreshOutputs(){
+  outDocker = genDockerfile();
+  outCompose = genCompose();
+  outEnv = genEnv();
+  hlCache.dockerfile = hlDockerfile(outDocker);
+  hlCache.compose = hlYaml(outCompose);
+  hlCache.env = hlEnv(outEnv);
+}
+function renderPreview(){
+  refreshOutputs();
+  const v = validateAll();
+
+  renderEnvBanner();
+
+  const envTabEl = $('tab-env');
+  if (!outEnv && state.activeTab==='env'){
+    state.activeTab = 'compose';
+    announce('.env tab hidden — no environment variables defined; switched to docker-compose.yml');
+  }
+  envTabEl.hidden = !outEnv;
+
+  ['dockerfile','compose','env'].forEach(tn=>{
+    const tab = $('tab-'+tn), panel = $('panel-'+tn);
+    const on = state.activeTab===tn;
+    tab.setAttribute('aria-selected', on?'true':'false');
+    tab.tabIndex = on?0:-1;
+    tab.hidden = tn==='env' && !outEnv;
+    panel.hidden = !on;
+  });
+
+  const cur = state.activeTab;
+  $('code-'+cur).innerHTML = hlCache[cur];
+
+  const dl = $('btn-download');
+  const blocked = v.errors.length>0;
+  dl.disabled = blocked;
+  dl.title = blocked ? 'Fix validation errors to enable download' : 'Download '+FILENAMES[cur];
+  const canRun = cur==='compose' && state.services[0] && state.services[0].source==='image' && (state.services[0].image||'').trim();
+  $('btn-run').hidden = !canRun;
+
+  renderSummary(v);
+}
+function renderSummary(v){
+  const box = $('validation');
+  box.replaceChildren();
+  if (v.errors.length){
+    const ul = h('ul',{class:'v-list v-err',role:'alert'});
+    v.errors.forEach(x=>ul.append(h('li',{},x)));
+    box.append(ul);
+  }
+  if (v.warnings.length){
+    const ul = h('ul',{class:'v-list v-warn'});
+    v.warnings.forEach(x=>ul.append(h('li',{},x)));
+    box.append(ul);
+  }
+  if (!v.errors.length && !v.warnings.length){
+    box.append(h('div',{class:'v-ok'},'✓ Configuration valid — download enabled'));
+  }
+}
+
+/* ---------- clipboard / download ---------- */
+async function copyToClipboard(text){
+  try{
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  }catch(e){ /* fall through */ }
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  }catch(e){ return false; }
+}
+function currentOutput(){ return state.activeTab==='dockerfile' ? outDocker : state.activeTab==='compose' ? outCompose : outEnv; }
+async function copyActive(){
+  const ok = await copyToClipboard(currentOutput());
+  const b = $('btn-copy');
+  b.textContent = ok ? 'Copied ✓' : 'Copy failed';
+  setTimeout(()=>{ b.textContent = 'Copy'; },1200);
+  announce(ok ? 'Copied '+FILENAMES[state.activeTab]+' to clipboard' : 'Copy failed');
+}
+function downloadActive(){
+  if (validateAll().errors.length) return;
+  const name = FILENAMES[state.activeTab];
+  const blob = new Blob([currentOutput()], {type:'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  announce('Downloaded '+name);
+}
+function dockerRunCmd(){
+  const sv = state.services[0];
+  if (!sv) return '';
+  const parts = ['docker','run','--rm'];
+  sv.ports.forEach(p=>{
+    if (/^\d+$/.test((p.host||'').trim()) && /^\d+$/.test((p.container||'').trim())) parts.push('-p', p.host.trim()+':'+p.container.trim());
+  });
+  sv.volumeMounts.forEach(m=>{
+    if ((m.volume||'').trim() && (m.target||'').trim()) parts.push('-v', m.volume.trim()+':'+m.target.trim());
+  });
+  sv.env.forEach(r=>{
+    if ((r.key||'').trim()) parts.push('-e', r.key.trim()+'='+String(r.value==null?'':r.value));
+  });
+  if ((sv.containerName||'').trim()) parts.push('--name', sv.containerName.trim());
+  parts.push((sv.image||'').trim());
+  return parts.map(p=>/[\s"']/.test(p) ? "'"+p.replace(/'/g,"'\\''")+"'" : p).join(' ');
+}
+async function copyDockerRun(){
+  const ok = await copyToClipboard(dockerRunCmd());
+  toast(ok ? 'Copied docker run command' : 'Copy failed', ok?'ok':'warn');
+}
+
+/* ---------- highlighters (hand-rolled tokenizers) ---------- */
+function hlWrapTokens(line, patterns){
+  const segs=[]; let plain=''; let i=0;
+  while (i<line.length){
+    let hit=null, type=null;
+    for (const [re,tp] of patterns){
+      re.lastIndex = i;
+      const m = re.exec(line);
+      if (m && m.index===i && m[0]){ hit=m[0]; type=tp; break; }
+    }
+    if (hit){
+      if (plain){ segs.push(['plain',plain]); plain=''; }
+      segs.push([type,hit]);
+      i += hit.length;
+    } else { plain += line[i]; i++; }
+  }
+  if (plain) segs.push(['plain',plain]);
+  return segs;
+}
+function hlSeg(segs){ return segs.map(([t,s])=> t==='plain'?esc(s):'<span class="tk-'+t+'">'+esc(s)+'</span>').join(''); }
+
+const DF_PATTERNS = [
+  [/"(?:[^"\\]|\\.)*"/g,'str'],          // double-quoted
+  [/'(?:[^'\\]|\\.)*'/g,'str'],          // single-quoted
+  [/--[\w.-]+(?:=(?:"[^"]*"|'[^']*'|[^\s]+))?/g,'flag'],
+  [/\\\s*$/g,'punct'],                   // continuation backslash
+  [/\bAS\b/g,'kw'],
+];
+const DF_KEYWORDS = /^(FROM|RUN|COPY|WORKDIR|ENV|ARG|EXPOSE|USER|CMD|ENTRYPOINT|HEALTHCHECK|SHELL|LABEL|VOLUME|ONBUILD|STOPSIGNAL|ADD|MAINTAINER)(\s|$)/;
+
+function hlDockerfile(src){
+  return src.split('\n').map(line=>{
+    if (!line) return '';
+    if (/^\s*#/.test(line)) return hlSeg([['comment',line]]);
+    const m = line.match(DF_KEYWORDS);
+    if (m){
+      const kw = m[1];
+      const rest = line.slice(kw.length);
+      return hlSeg([['kw',kw]]) + hlWrapTokens(rest, DF_PATTERNS).map(hlSeg2).join('');
+    }
+    return hlWrapTokens(line, DF_PATTERNS).map(hlSeg2).join('');
+  }).join('\n');
+}
+function hlSeg2(seg){ return hlSeg([seg]); }
+
+const YAML_PATTERNS = [
+  [/"(?:[^"\\]|\\.)*"/g,'str'],
+  [/'(?:[^'\\]|\\.|'')*'/g,'str'],
+  [/\{\}|\[\]|\{|\}|\[|\]|,/g,'punct'],
+  [/(?<![\w.$/-])\d+(?:\.\d+)?\b/g,'num'],
+  [/(?<![\w.$-])[\w.$-]+(?=:\s|$|:$)/g,'key'],
+];
+function hlYaml(src){
+  return src.split('\n').map(line=>{
+    if (!line) return '';
+    /* split off a trailing comment not inside quotes */
+    let q=null, cStart=-1;
+    for (let i=0;i<line.length;i++){
+      const c=line[i];
+      if (q){
+        if (q==="'" && c==="'" && line[i+1]==="'"){ i++; continue; }
+        if (c===q && q==='"' && line[i-1]==='\\') continue;
+        if (c===q) q=null;
+        continue;
+      }
+      if (c==='"'||c==="'"){ q=c; continue; }
+      if (c==='#' && (i===0 || line[i-1]===' ' || line[i-1]==='\t')){ cStart=i; break; }
+    }
+    const code = cStart===-1 ? line : line.slice(0,cStart);
+    const comm = cStart===-1 ? '' : line.slice(cStart);
+    /* preserve indentation; emit list dash as a punctuation token */
+    const head = code.match(/^(\s*)(- )?/);
+    let html = esc(head[1]);
+    if (head[2]) html += hlSeg([['punct','-']]) + ' ';
+    const rest = code.slice(head[0].length);
+    if (rest) html += hlWrapTokens(rest, YAML_PATTERNS).map(hlSeg2).join('');
+    if (comm) html += hlSeg([['comment',comm]]);
+    return html;
+  }).join('\n');
+}
+const ENV_PATTERNS = [
+  [/^export\b/g,'kw'],
+  [/(?<![\w.$-])[A-Za-z_][A-Za-z0-9_.-]*(?=\s*=)/g,'key'],
+  [/"(?:[^"\\]|\\.)*"|'[^']*'/g,'str'],
+  [/=/g,'punct'],
+];
+function hlEnv(src){
+  return src.split('\n').map(line=>{
+    if (!line) return '';
+    if (/^\s*#/.test(line)) return hlSeg([['comment',line]]);
+    return hlWrapTokens(line, ENV_PATTERNS).map(hlSeg2).join('');
+  }).join('\n');
+}
+
+/* ============================================================= 9. toast + announcer === */
+let toastTimer = null;
+function toast(msg, kind){
+  const region = $('toasts');
+  if (!region) return;
+  region.replaceChildren();
+  const t = h('div',{class:'toast '+(kind==='warn'?'warn':''),role:'status'},[
+    h('span',{class:'toast-msg'},msg),
+    btn('toast-dismiss','btn btn-ghost btn-icon toast-x','×',{'aria-label':'Dismiss notification'}),
+  ]);
+  region.append(t);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>{ t.remove(); }, 3500);
+}
+function announce(msg){
+  const el = $('live-a11y');
+  if (!el) return;
+  el.textContent = '';
+  setTimeout(()=>{ el.textContent = msg; }, 30);
+}
+
+/* ============================================================= 10. control wiring ===== */
+function setByPath(root, path, value){
+  const parts = path.split('.');
+  let cur = root;
+  for (let i=0;i<parts.length-1;i++){
+    const seg = parts[i];
+    if (cur[seg]===undefined) cur[seg] = /^\d+$/.test(parts[i+1]) ? [] : {};
+    cur = cur[seg];
+  }
+  cur[parts[parts.length-1]] = value;
+}
+function toggleInArray(arr, val, on){
+  if (on){ if (!arr.includes(val)) arr.push(val); }
+  else { const i=arr.indexOf(val); if (i>-1) arr.splice(i,1); }
+}
+function onControlInput(e){
+  const t = e.target;
+  if (!t || !t.dataset) return;
+  if (t.dataset.dep !== undefined && t.type==='checkbox'){
+    const sv = findServiceByElement(t);
+    if (sv) toggleInArray(sv.dependsOn, t.dataset.dep, t.checked);
+    scheduleRegen();
+    return;
+  }
+  if (t.dataset.net !== undefined && t.type==='checkbox'){
+    const sv = findServiceByElement(t);
+    if (sv) toggleInArray(sv.networks, t.dataset.net, t.checked);
+    scheduleRegen();
+    return;
+  }
+  if (t.dataset.f === undefined) return;
+  const isSvcName = /^services\.\d+\.name$/.test(t.dataset.f);
+  let prevName = null;
+  if (isSvcName){
+    const sv = state.services[+t.dataset.f.split('.')[1]];
+    prevName = sv ? sv.name : null;
+  }
+  const value = t.type==='checkbox' ? t.checked : t.value;
+  setByPath(state, t.dataset.f, value);
+  /* renaming a service: rewrite references in every depends_on list, then re-render
+     (debounced) so depends/volume/network attach groups repopulate */
+  if (isSvcName){
+    if (prevName && prevName!==value){
+      state.services.forEach(o=>{
+        if (o.dependsOn.includes(prevName)) o.dependsOn = o.dependsOn.map(d=>d===prevName?value:d);
+      });
+    }
+    scheduleStruct();
+  }
+  /* switching a step's type to ENV needs an initial key/value row */
+  if (t.dataset.struct && /\.type$/.test(t.dataset.f) && t.value==='ENV'){
+    const parts = t.dataset.f.split('.');
+    let cur = state;
+    for (let i=0;i<parts.length-1;i++) cur = cur[parts[i]];
+    if (!Array.isArray(cur.env)) cur.env = [{key:'', value:''}];
+  }
+  if (t.dataset.struct) structuralUpdate();
+  else if (!isSvcName) scheduleRegen();
+}
+function findServiceByElement(el){
+  /* walk up to the servicefieldset legend index via services list order in DOM */
+  const svcEl = el.closest('fieldset.svc');
+  if (!svcEl) return null;
+  const all = [...document.querySelectorAll('#form-panel fieldset.svc')];
+  const idx = all.indexOf(svcEl);
+  return idx>-1 ? state.services[idx] : null;
+}
+const scheduleRegen = debounce(()=>{ saveState(); renderPreview(); }, DEBOUNCE_MS);
+const scheduleStruct = debounce(()=>{ structuralUpdate(); }, DEBOUNCE_MS);
+
+document.addEventListener('input', onControlInput);
+document.addEventListener('change', onControlInput);
+
+document.addEventListener('keydown', e=>{
+  const tab = e.target instanceof Element ? e.target.closest('.tab') : null;
+  if (!tab) return;
+  if (!['ArrowRight','ArrowLeft','Home','End'].includes(e.key)) return;
+  e.preventDefault();
+  const visible = ['dockerfile','compose','env'].filter(tn=>!$('tab-'+tn).hidden);
+  if (!visible.length) return;
+  let i = visible.indexOf(state.activeTab);
+  if (i<0) i=0;
+  if (e.key==='ArrowRight') i=(i+1)%visible.length;
+  else if (e.key==='ArrowLeft') i=(i-1+visible.length)%visible.length;
+  else if (e.key==='Home') i=0;
+  else i=visible.length-1;
+  state.activeTab = visible[i];
+  saveState();
+  renderPreview();
+  $('tab-'+visible[i]).focus();
+});
+window.addEventListener('pagehide', ()=>{ try{ saveState(); }catch(e){} });
+
+function init(){
+  const saved = loadState();
+  if (saved){
+    state = saved;
+  } else {
+    state = seedState();
+    try{ state.theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'; }
+    catch(e){ state.theme = 'dark'; }
+  }
+  applyTheme(state.theme);
+  renderSection();
+  renderPreview();     /* clamps activeTab (.env hidden) and announces if needed */
+}
+try{ init(); }catch(err){ console.error(err); }
+</script>
+</body>
+</html>
