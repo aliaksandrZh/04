@@ -1,0 +1,2125 @@
+<!DOCTYPE html>
+<!--
+  Docker UI — single-file, zero-dependency visual editor for Dockerfiles & docker-compose.yml.
+  Open this file directly in a browser (file:// works); there is no server, no build step, and
+  the page makes zero network requests. Vanilla JS (ES2020) + CSS only.
+
+  FILE STRUCTURE
+  ─ <style>   Theme CSS custom properties (dark default, [data-theme="light"] override),
+              three-pane grid (260px sidebar | fluid form | ≥380px preview), form controls,
+              repeater rows, preview/token colors, responsive breakpoints (≤1100px, ≤900px
+              stacks vertically with a horizontal chip nav), prefers-reduced-motion guard.
+  ─ <body>    Topbar (title, theme toggle, Reset) · <aside> section nav (Image / Compose /
+              Volumes / Networks / Environment) · <main> form panel (renders the active
+              section) · <section> preview (ARIA tablist: Dockerfile / docker-compose.yml,
+              Copy+Download, error & warning banners, aria-live status line) · toast ·
+              image <datalist>.
+  ─ <script>  One IIFE, in order:
+      1) constants  — step-type list, restart policies, sidebar sections, SVG icon paths
+      2) state      — seed/normalize, localStorage persistence ("docker-ui-state-v2",
+                      theme "docker-ui-theme"), try/catch + in-memory fallback
+      3) generators — hand-rolled YAML emitter (no JSON.stringify), Dockerfile emitter
+                      (continuation wrapping, FROM … AS, COPY --from), .env parser,
+                      docker-run synthesizer
+      4) validator  — errors E1–E8 + warnings, field-path anchored
+      5) highlight  — hand-rolled per-tab tokenizers (Dockerfile, YAML)
+      6) DOM helpers, section renderers, repeaters (drag-to-reorder + ▲/▼ buttons)
+      7) preview    — tabs, syntax highlight, Copy / Download / docker run, banners
+      8) wiring     — delegated input & click handling, 150 ms debounced regenerate +
+                      persist, bootstrap (restore-or-seed from localStorage)
+
+  Data flow: any input → state mutation → 150 ms debounce → validate → generate →
+  highlight → preview → persist. Value edits never re-render the form (focus is kept);
+  structural edits (add/remove/reorder/toggle) re-render the active section.
+  Validation errors block Download (Copy + preview stay live); warnings never block.
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker UI — Dockerfile &amp; Compose builder</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='3' y='3' width='18' height='18' rx='4' fill='%234f8cff'/%3E%3Cpath d='M7 14h10l-1.5 4h-7z' fill='%230f1117'/%3E%3Crect x='8' y='9' width='2.4' height='4' fill='%230f1117'/%3E%3Crect x='11' y='9' width='2.4' height='4' fill='%230f1117'/%3E%3Crect x='14' y='9' width='2.4' height='4' fill='%230f1117'/%3E%3C/svg%3E">
+<style>
+/* ── Theme tokens ─────────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  --bg:#0f1117; --panel:#171a21; --panel2:#1d2230; --input-bg:#0d0f15; --code-bg:#0b0d13;
+  --border:#262b36; --border-soft:#20242e;
+  --text:#e7eaf2; --text-dim:#98a2b3;
+  --accent:#4f8cff; --accent-ink:#7aa7ff; --accent-soft:rgba(79,140,255,.14);
+  --error:#ff5d5d; --error-soft:rgba(255,93,93,.1);
+  --success:#3ecf8e; --warn:#f0b429; --warn-soft:rgba(240,180,41,.1);
+  --tk-com:#697487; --tk-kw:#6ea3ff; --tk-str:#3ecf8e; --tk-num:#f0b429; --tk-bool:#ef8fd2;
+  --tk-key:#8fb4ff; --tk-flag:#c9a7f0; --tk-dash:#7f8ca3;
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  --radius:6px; --tr:130ms;
+}
+[data-theme="light"]{
+  --bg:#f3f5f9; --panel:#ffffff; --panel2:#eef1f7; --input-bg:#ffffff; --code-bg:#f7f9fd;
+  --border:#d8dee9; --border-soft:#e4e8ef;
+  --text:#1b2333; --text-dim:#5c6779;
+  --accent-ink:#3560c0; --accent-soft:rgba(79,140,255,.13);
+  --error:#d84a4a; --error-soft:rgba(216,74,74,.08);
+  --success:#189a63; --warn:#a97400; --warn-soft:rgba(176,124,10,.09);
+  --tk-com:#8a93a5; --tk-kw:#2f62d8; --tk-str:#128a55; --tk-num:#a35a00; --tk-bool:#c1378d;
+  --tk-key:#3555bf; --tk-flag:#7c3aed; --tk-dash:#8a93a5;
+}
+
+/* ── Shell / three-pane grid ──────────────────────────────────────────────── */
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;line-height:1.45}
+button{font:inherit;color:inherit}
+.app{
+  display:grid;
+  grid-template-columns:260px minmax(0,1fr) minmax(380px,42%);
+  grid-template-rows:auto minmax(0,1fr);
+  grid-template-areas:"top top top" "side form prev";
+  height:100vh; max-width:2560px; margin:0 auto;
+}
+.topbar{grid-area:top;display:flex;justify-content:space-between;align-items:center;gap:12px;
+  background:var(--panel);border-bottom:1px solid var(--border);padding:8px 14px}
+.brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+.brand h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+.brand .sub{color:var(--text-dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{display:flex;gap:8px}
+
+.sidebar{grid-area:side;background:var(--panel);border-right:1px solid var(--border);
+  overflow-y:auto;display:flex;flex-direction:column}
+#nav{display:flex;flex-direction:column;gap:4px;padding:10px}
+.nav-btn{display:flex;align-items:center;gap:10px;text-align:left;background:none;border:1px solid transparent;
+  border-radius:var(--radius);padding:9px 10px;cursor:pointer;color:var(--text-dim);
+  transition:background var(--tr),color var(--tr)}
+.nav-btn:hover{background:var(--panel2);color:var(--text)}
+.nav-btn[aria-current="true"]{background:var(--accent-soft);color:var(--accent-ink);font-weight:600}
+.nav-btn svg{flex:0 0 auto}
+.side-foot{margin-top:auto;padding:10px 12px;color:var(--text-dim);font-size:11px;border-top:1px solid var(--border-soft)}
+
+.panel-form{grid-area:form;overflow-y:auto;padding:16px 18px 56px}
+.panel-preview{grid-area:prev;display:flex;flex-direction:column;min-width:0;
+  background:var(--panel);border-left:1px solid var(--border)}
+
+/* ── Section headers / cards ──────────────────────────────────────────────── */
+.sec-head{display:flex;align-items:center;gap:9px;margin:2px 0 4px}
+.sec-head h2{font-size:15px;margin:0;font-weight:650}
+.sec-desc{color:var(--text-dim);font-size:12.5px;margin:0 0 14px;max-width:72ch}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin:0 0 12px}
+.card-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.card-head h3{font-size:12.5px;margin:0;color:var(--text-dim);font-weight:650;letter-spacing:.3px}
+.spacer{flex:1}
+.controls{display:flex;gap:6px}
+.group{border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin:0 0 10px}
+.group>.flabel{display:block;margin-bottom:7px}
+
+/* ── Form fields ──────────────────────────────────────────────────────────── */
+.field{display:flex;flex-direction:column;gap:5px;min-width:0}
+.flabel{font-size:12px;color:var(--text-dim)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}
+.grid-gap{display:flex;flex-direction:column;gap:9px}
+.inp{width:100%;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius);
+  color:var(--text);padding:7px 10px;font:inherit;min-height:34px;
+  transition:border-color var(--tr),box-shadow var(--tr)}
+.inp.mono,textarea.inp{font-family:var(--mono);font-size:12.8px}
+.inp::placeholder{color:var(--text-dim);opacity:.72}
+select.inp{width:auto;min-width:120px;padding-right:28px}
+textarea.inp{resize:vertical;min-height:58px}
+.chk{width:16px;height:16px;accent-color:var(--accent)}
+.toggle-label{display:flex;align-items:center;gap:9px;cursor:pointer;font-weight:600;font-size:13px}
+.radio-group{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}
+.radio-group>.flabel{width:100%}
+.mono-lbl span{font-family:var(--mono);font-size:12.3px}
+.radio-opt{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;
+  border:1px solid var(--border);border-radius:var(--radius);padding:5px 10px;background:var(--input-bg)}
+.radio-opt input{accent-color:var(--accent);margin:0}
+.hint{color:var(--text-dim);font-size:12px;margin-top:2px}
+.field-error{color:var(--error);font-size:12px;margin-top:4px;flex-basis:100%}
+.inv .inp{border-color:var(--error)}
+
+/* ── Repeaters & step rows ────────────────────────────────────────────────── */
+.rep{display:flex;flex-direction:column;gap:8px}
+.rep-list{display:flex;flex-direction:column;gap:8px}
+.rep-row{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}
+.rep-row .inp{width:auto;flex:1 1 130px;min-width:90px}
+.rep-row .btn{flex:0 0 auto}
+.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.step-row{display:flex;gap:8px;align-items:flex-start;background:var(--panel2);
+  border:1px solid var(--border);border-radius:var(--radius);padding:9px}
+.step-row.dragging{opacity:.4}
+.step-row.drop-above{box-shadow:0 -2px 0 0 var(--accent)}
+.step-row.drop-below{box-shadow:0 2px 0 0 var(--accent)}
+.step-fields{flex:1 1 auto;display:flex;flex-direction:column;gap:9px;min-width:0}
+.type-sel{flex:0 0 130px;width:auto;min-width:130px}
+.grip{cursor:grab;color:var(--text-dim);padding:5px 2px;flex:0 0 auto;touch-action:none}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius);border:1px solid var(--border);
+  background:transparent;color:var(--text);padding:7px 12px;cursor:pointer;min-height:34px;
+  transition:background var(--tr),border-color var(--tr),color var(--tr)}
+.btn:hover:enabled{border-color:var(--accent);color:var(--accent-ink)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-primary:hover:enabled{color:#fff}
+.btn-danger:hover:enabled{color:var(--error);border-color:var(--error);background:var(--error-soft)}
+.btn-ico{padding:6px;min-height:0}
+.btn-sm{padding:5px 10px;min-height:30px;font-size:13px}
+
+/* ── Preview panel ────────────────────────────────────────────────────────── */
+.pv-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;
+  border-bottom:1px solid var(--border);flex-wrap:wrap}
+.pv-tabs{display:flex;gap:4px}
+.pv-tab{background:none;border:1px solid transparent;border-radius:var(--radius);padding:6px 11px;
+  cursor:pointer;color:var(--text-dim);font-family:var(--mono);font-size:12.5px;
+  transition:color var(--tr),background var(--tr),box-shadow var(--tr)}
+.pv-tab:hover{color:var(--text)}
+.pv-tab[aria-selected="true"]{background:var(--panel2);color:var(--text);border-color:var(--border);
+  box-shadow:0 1px 5px rgba(0,0,0,.35)}
+[data-theme="light"] .pv-tab[aria-selected="true"]{box-shadow:0 1px 4px rgba(15,17,23,.12)}
+.pv-actions{display:flex;gap:8px;align-items:center}
+.pv-status{padding:6px 12px;color:var(--text-dim);font-size:12px;font-family:var(--mono);
+  border-bottom:1px solid var(--border-soft);min-height:27px}
+.pv-banners{padding:0 12px}
+.banner{display:flex;gap:8px;align-items:flex-start;border-radius:var(--radius);border:1px solid;
+  padding:8px 10px;margin:8px 0;font-size:12.5px}
+.banner svg{flex:0 0 auto;margin-top:1px}
+.banner-err{color:var(--error);border-color:var(--error);background:var(--error-soft)}
+.banner-warn{color:var(--warn);border-color:var(--warn);background:var(--warn-soft)}
+.banner .blist{display:flex;flex-direction:column;gap:3px;margin-top:6px;word-break:break-word}
+.pv-scroll{flex:1;min-height:0;overflow:auto}
+.pv-scroll pre{margin:0;padding:12px 14px 30px;min-height:100%}
+.pv-scroll code{font-family:var(--mono);font-size:12.6px;line-height:1.55;white-space:pre;display:block}
+.tk-com{color:var(--tk-com);font-style:italic}
+.tk-kw{color:var(--tk-kw);font-weight:600}
+.tk-str{color:var(--tk-str)}
+.tk-num{color:var(--tk-num)}
+.tk-bool{color:var(--tk-bool)}
+.tk-key{color:var(--tk-key)}
+.tk-flag{color:var(--tk-flag)}
+.tk-dash{color:var(--tk-dash)}
+
+/* ── Toast, misc ──────────────────────────────────────────────────────────── */
+.toast{position:fixed;left:50%;bottom:18px;transform:translate(-50%,8px);background:var(--panel);
+  border:1px solid var(--accent);color:var(--text);padding:8px 14px;border-radius:var(--radius);
+  font-size:13px;opacity:0;pointer-events:none;transition:opacity var(--tr),transform var(--tr);
+  z-index:50;max-width:min(90vw,480px)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.visually-hidden{position:absolute!important;width:1px;height:1px;margin:-1px;padding:0;
+  overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+/* ── Focus rings ──────────────────────────────────────────────────────────── */
+.btn:focus-visible,.nav-btn:focus-visible,.pv-tab:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.inp:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+[tabindex="0"]:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+/* ── Responsive ───────────────────────────────────────────────────────────── */
+@media (max-width:1100px){
+  .app{grid-template-columns:230px minmax(0,1fr) minmax(320px,40%)}
+}
+@media (max-width:900px){
+  .app{grid-template-columns:1fr;grid-template-rows:repeat(4,auto);
+    grid-template-areas:"top" "side" "form" "prev";height:auto}
+  .sidebar{border-right:0;border-bottom:1px solid var(--border);overflow:visible}
+  #nav{flex-direction:row;overflow-x:auto;padding:8px;gap:6px}
+  .nav-btn{flex:0 0 auto}
+  .nav-btn span{white-space:nowrap}
+  .panel-form,.panel-preview{overflow:visible}
+  .panel-preview{border-left:0;border-top:1px solid var(--border)}
+  .pv-scroll{max-height:60vh}
+  .side-foot{display:none}
+}
+@media (max-width:620px){
+  .row2,.row3{grid-template-columns:1fr}
+  .rep-row .inp{flex:1 1 100%}
+  .brand .sub{display:none}
+  .panel-form{padding:12px 12px 48px}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition:none!important;animation:none!important}
+}
+</style>
+</head>
+<body>
+
+<datalist id="img-presets">
+  <option value="node:20-alpine"></option>
+  <option value="node:20-slim"></option>
+  <option value="node:18-alpine"></option>
+  <option value="python:3.12-slim"></option>
+  <option value="python:3.12-alpine"></option>
+  <option value="python:3.11-slim"></option>
+  <option value="nginx:alpine"></option>
+  <option value="nginx:1.27-alpine"></option>
+  <option value="ubuntu:24.04"></option>
+  <option value="ubuntu:22.04"></option>
+  <option value="alpine:3.20"></option>
+  <option value="debian:12-slim"></option>
+  <option value="debian:bookworm-slim"></option>
+  <option value="golang:1.23-alpine"></option>
+  <option value="golang:1.22-alpine"></option>
+  <option value="openjdk:21-slim"></option>
+  <option value="eclipse-temurin:21-jre-alpine"></option>
+  <option value="redis:7-alpine"></option>
+  <option value="postgres:16-alpine"></option>
+  <option value="mysql:8.4"></option>
+  <option value="httpd:alpine"></option>
+  <option value="php:8.3-fpm-alpine"></option>
+  <option value="ruby:3.3-slim"></option>
+  <option value="rust:1.79-slim"></option>
+  <option value="busybox:stable"></option>
+  <option value="traefik:v3.1"></option>
+</datalist>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>Docker UI</h1>
+    <span class="sub">Visual Dockerfile &amp; docker-compose.yml builder — files generate live</span>
+  </div>
+  <div class="top-actions">
+    <button id="btn-theme" class="btn btn-ghost btn-sm" type="button" title="Toggle light / dark theme" aria-label="Toggle light or dark theme">
+      <svg id="ico-sun" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6 19 19M19 5l-1.4 1.4M6.4 17.6 5 19"></path></svg>
+      <svg id="ico-moon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"></path></svg>
+      <span>Theme</span>
+    </button>
+    <button id="btn-reset" class="btn btn-ghost btn-sm" type="button" title="Reset the whole configuration to the default sample">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10a8 8 0 1 1 2.2 6.6"></path><path d="M3 4v6h6"></path></svg>
+      <span>Reset</span>
+    </button>
+  </div>
+</header>
+
+<div class="app">
+  <aside class="sidebar" aria-label="Configuration sections">
+    <nav id="nav" aria-label="Configuration sections"></nav>
+    <div class="side-foot" aria-hidden="true">Everything is generated in your browser and saved to localStorage. Nothing leaves this page.</div>
+  </aside>
+
+  <main id="form-panel" class="panel-form" aria-label="Configuration forms"></main>
+
+  <section class="panel-preview" aria-label="Generated output">
+    <div class="pv-bar">
+      <div class="pv-tabs" role="tablist" aria-label="Generated files">
+        <button type="button" class="pv-tab" role="tab" id="tab-dockerfile" data-tab="dockerfile" aria-selected="true" aria-controls="view-dockerfile" tabindex="0">Dockerfile</button>
+        <button type="button" class="pv-tab" role="tab" id="tab-compose" data-tab="compose" aria-selected="false" aria-controls="view-compose" tabindex="-1">docker-compose.yml</button>
+      </div>
+      <div class="pv-actions">
+        <button id="btn-copy-tab" class="btn btn-ghost btn-sm" type="button">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          <span>Copy</span>
+        </button>
+        <button id="btn-copy-run" class="btn btn-ghost btn-sm" type="button" hidden>
+          <span>docker run</span>
+        </button>
+        <button id="btn-download" class="btn btn-primary btn-sm" type="button">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M8 11l4 4 4-4"></path><path d="M4 21h16"></path></svg>
+          <span>Download</span>
+        </button>
+      </div>
+    </div>
+    <div id="pv-status" class="pv-status" role="status" aria-live="polite"></div>
+    <div id="pv-banners"></div>
+    <div id="view-dockerfile" class="pv-scroll" role="tabpanel" aria-labelledby="tab-dockerfile" tabindex="0">
+      <pre><code id="code-dockerfile"></code></pre>
+    </div>
+    <div id="view-compose" class="pv-scroll" role="tabpanel" aria-labelledby="tab-compose" tabindex="0" hidden>
+      <pre><code id="code-compose"></code></pre>
+    </div>
+  </section>
+</div>
+
+<div id="toast" class="toast" role="status"></div>
+
+<script>
+(() => {
+'use strict';
+
+// __PURE_START__
+
+/* ═══ 1 · Constants ═════════════════════════════════════════════════════════ */
+
+const IDENT = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const STEP_TYPES = ['RUN','COPY','WORKDIR','ENV','ARG','EXPOSE','USER','CMD','ENTRYPOINT','HEALTHCHECK'];
+const STORAGE_SCHEMA = 2;
+
+/* ═══ 2 · Tiny pure helpers ═════════════════════════════════════════════════ */
+
+let seq = 0;
+function uid(){ return 'x' + (++seq) + '-' + Math.random().toString(36).slice(2, 8); }
+
+function getIn(obj, path){
+  return String(path).split('.').reduce((o, k) => (o == null ? o : o[k]), obj);
+}
+function setIn(obj, path, val){
+  const ks = String(path).split('.');
+  let o = obj;
+  for (let i = 0; i < ks.length - 1; i++){ o = o[ks[i]]; if (o == null) return obj; }
+  o[ks[ks.length - 1]] = val;
+  return obj;
+}
+
+/* Keeps references consistent when a service / volume / network / stage is renamed:
+   depends_on lists, volume mounts, network attachments and COPY --from targets. */
+function renameRefs(s, path, oldV, newV){
+  const m = /(?:^|\.)(services|volumes|networks|stages)\.(\d+)\.name$/.exec(String(path || ''));
+  if (!m || oldV == null || oldV === '' || newV === oldV) return s;
+  const kind = m[1];
+  const o = String(oldV), n = String(newV == null ? '' : newV);
+  if (!n) return s;
+  if (kind === 'services') (s.services || []).forEach(sv => { sv.dependsOn = (sv.dependsOn || []).map(x => x === o ? n : x); });
+  if (kind === 'volumes')  (s.services || []).forEach(sv => { sv.volumeMounts = (sv.volumeMounts || []).map(x => x.volume === o ? Object.assign({}, x, {volume: n}) : x); });
+  if (kind === 'networks')(s.services || []).forEach(sv => { sv.networks = (sv.networks || []).map(x => x === o ? n : x); });
+  if (kind === 'stages')   (s.docker.stages || []).forEach(st => (st.steps || []).forEach(sp => { if (sp.from === o) sp.from = n; }));
+  return s;
+}
+
+/* ═══ 3 · Seed & shape ══════════════════════════════════════════════════════ */
+
+function newService(name){
+  return {
+    id: uid(), name: name || '', source: 'build', image: '',
+    buildPath: '.', buildDockerfile: '', buildTarget: '',
+    containerName: '', restart: '',
+    ports: [], dependsOn: [], env: [], command: '',
+    healthcheck: { enabled: false, test: '', interval: '30s', timeout: '3s', retries: '3' },
+    volumeMounts: [], networks: []
+  };
+}
+
+function seedState(){
+  return {
+    schema: STORAGE_SCHEMA,
+    theme: 'dark',
+    version: '3.8',
+    activeSection: 'image',
+    activeTab: 'dockerfile',
+    docker: {
+      singleBaseImage: 'node:20-alpine',
+      multiStage: false,
+      steps: [
+        { id: uid(), type: 'WORKDIR', path: '/app' },
+        { id: uid(), type: 'COPY', src: '.', dest: '.', chown: '', from: '' },
+        { id: uid(), type: 'RUN', command: 'npm ci --omit=dev' },
+        { id: uid(), type: 'CMD', mode: 'exec', exec: 'node\nindex.js', shell: '' }
+      ],
+      stages: [
+        { id: uid(), name: 'build', baseImage: 'node:20-alpine', steps: [
+          { id: uid(), type: 'COPY', src: '.', dest: '/app', chown: '', from: '' },
+          { id: uid(), type: 'RUN', command: 'npm ci --omit=dev' }
+        ] },
+        { id: uid(), name: 'runtime', baseImage: 'node:20-alpine', steps: [
+          { id: uid(), type: 'COPY', src: '/app', dest: '/app', chown: '', from: 'build' },
+          { id: uid(), type: 'CMD', mode: 'exec', exec: 'node\nindex.js', shell: '' }
+        ] }
+      ]
+    },
+    services: (() => {
+      const app = newService('app');
+      app.ports = [{ id: uid(), host: '3000', container: '3000', proto: 'tcp' }];
+      app.volumeMounts = [{ id: uid(), volume: 'app-data', target: '/data', readonly: false }];
+      return [app];
+    })(),
+    volumes:  [{ id: uid(), name: 'app-data', driver: 'local', driverOpts: [] }],
+    networks: [],
+    dotenv:   []
+  };
+}
+
+function normalize(s){
+  const seed = seedState();
+  ['theme','version','activeSection','activeTab','docker','services','volumes','networks','dotenv'].forEach(k => {
+    if (s[k] === undefined) s[k] = seed[k];
+  });
+  if (!s.docker || typeof s.docker !== 'object') s.docker = seed.docker;
+  ['singleBaseImage','multiStage','steps','stages'].forEach(k => {
+    if (s.docker[k] === undefined) s.docker[k] = seed.docker[k];
+  });
+  ['services','volumes','networks','dotenv'].forEach(k => {
+    if (!Array.isArray(s[k])) s[k] = seed[k];
+  });
+  if (!Array.isArray(s.docker.steps)) s.docker.steps = [];
+  if (!Array.isArray(s.docker.stages)) s.docker.stages = [];
+  s.services.forEach(svc => {
+    ['ports','dependsOn','env','volumeMounts','networks'].forEach(k => { if (!Array.isArray(svc[k])) svc[k] = []; });
+    if (!svc.healthcheck || typeof svc.healthcheck !== 'object') svc.healthcheck = { enabled: false, test: '', interval: '30s', timeout: '3s', retries: '3' };
+  });
+  (s.volumes || []).forEach(v => { if (!Array.isArray(v.driverOpts)) v.driverOpts = []; });
+  return s;
+}
+
+/* ═══ 4 · YAML emitter (hand-rolled — no JSON.stringify) ════════════════════ */
+
+function yDq(s){
+  return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+function yNeedsQuote(s){
+  if (s === '') return true;
+  if (/^\s|\s$/.test(s)) return true;
+  if (s.includes(':') || s.includes('#')) return true;
+  if ('-?:,[]{}#&*!|>\'"%@`'.indexOf(s[0]) >= 0) return true;
+  if (/^(y|Y|n|N|yes|no|true|false|on|off|null|~)$/i.test(s)) return true;
+  if (/^[+-]?(\d[\d_]*(\.\d*)?([eE][+-]?\d+)?|\.\d+|(\d[\d_]*)?\.(\d+|inf|Inf|INF)|\.nan)$/.test(s)) return true;
+  if (/^0[\d_]/.test(s)) return true;
+  return false;
+}
+
+function yScalar(v){
+  const s = String(v == null ? '' : v);
+  if (s === '') return '""';
+  if (yNeedsQuote(s)) return yDq(s);
+  return s;
+}
+
+/* ═══ 5 · Small parsers ═════════════════════════════════════════════════════ */
+
+/* If the string is a JSON array literal, return its string elements (exec form). */
+function parseExecJson(t){
+  const s = String(t == null ? '' : t).trim();
+  if (!s.startsWith('[')) return null;
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? v.map(String) : null;
+  } catch (_) { return null; }
+}
+
+/* .env paste import: KEY=VALUE lines; # / ! comments, blank lines and “export ”
+   prefixes ignored; quotes and inner “#” preserved verbatim (dotenv semantics). */
+function parseDotenv(text){
+  const out = [];
+  String(text == null ? '' : text).split(/\r?\n/).forEach(raw => {
+    let s = raw.trim();
+    if (!s || s[0] === '#' || s[0] === '!') return;
+    if (/^export\s/.test(s)) s = s.replace(/^export\s+/, '');
+    const eq = s.indexOf('=');
+    if (eq < 1) return;
+    const k = s.slice(0, eq).trim();
+    if (!k) return;
+    out.push({ key: k, value: s.slice(eq + 1).trim() });
+  });
+  return out;
+}
+
+/* ═══ 6 · Generator: docker-compose.yml ═════════════════════════════════════ */
+
+function genCompose(s){
+  const L = [];
+  if (s.version) L.push('version: ' + yScalar(s.version));
+  L.push('services:');
+  (s.services || []).forEach(svc => {
+    L.push('  ' + yScalar(svc.name) + ':');
+    const b = t => L.push('    ' + t);
+
+    if (svc.source === 'image') {
+      if ((svc.image || '').trim()) b('image: ' + yScalar(svc.image.trim()));
+    } else {
+      const ctx = (svc.buildPath || '').trim() || '.';
+      const df  = (svc.buildDockerfile || '').trim();
+      const tgt = (svc.buildTarget || '').trim();
+      if (df || tgt) {
+        b('build:');
+        b('  context: ' + yScalar(ctx));
+        if (df) b('  dockerfile: ' + yScalar(df));
+        if (tgt) b('  target: ' + yScalar(tgt));
+      } else {
+        b('build: ' + yScalar(ctx));
+      }
+    }
+
+    if ((svc.containerName || '').trim()) b('container_name: ' + yScalar(svc.containerName.trim()));
+    if (svc.restart) b('restart: ' + yScalar(svc.restart));
+
+    const env = (svc.env || []).filter(r => (r.key || '').trim());
+    if (env.length) {
+      b('environment:');
+      env.forEach(r => L.push('      ' + yScalar(r.key.trim()) + ': ' + yScalar(r.value)));
+    }
+
+    const ports = (svc.ports || []).filter(p => (p.host || '').trim() || (p.container || '').trim());
+    if (ports.length) {
+      b('ports:');
+      ports.forEach(p => L.push('      - ' + yScalar(((p.host || '').trim() + ':' + (p.container || '').trim()) + (p.proto === 'udp' ? '/udp' : ''))));
+    }
+
+    if ((svc.dependsOn || []).length) {
+      b('depends_on:');
+      svc.dependsOn.forEach(n => L.push('      - ' + yScalar(n)));
+    }
+
+    const cmd = (svc.command || '').trim();
+    if (cmd) {
+      const ex = parseExecJson(cmd);
+      if (ex) { b('command:'); ex.forEach(a => L.push('      - ' + yScalar(a))); }
+      else b('command: ' + yScalar(cmd));
+    }
+
+    const hc = svc.healthcheck;
+    if (hc && hc.enabled && (hc.test || '').trim()) {
+      b('healthcheck:');
+      const ex = parseExecJson((hc.test || '').trim());
+      if (ex) { b('  test:'); ex.forEach(a => L.push('        - ' + yScalar(a))); }
+      else b('  test: ' + yScalar((hc.test || '').trim()));
+      b('  interval: ' + yScalar((hc.interval || '30s').trim()));
+      b('  timeout: ' + yScalar((hc.timeout || '3s').trim()));
+      const r = String(hc.retries == null ? '' : hc.retries).trim();
+      if (r) b('  retries: ' + (/^\d+$/.test(r) ? r : yScalar(r)));
+    }
+
+    const mounts = (svc.volumeMounts || []).filter(m => (m.volume || '').trim() || (m.target || '').trim());
+    if (mounts.length) {
+      b('volumes:');
+      mounts.forEach(m => L.push('      - ' + yScalar(((m.volume || '').trim() + ':' + (m.target || '').trim()) + (m.readonly ? ':ro' : ''))));
+    }
+
+    if ((svc.networks || []).length) {
+      b('networks:');
+      svc.networks.forEach(n => L.push('      - ' + yScalar(n)));
+    }
+  });
+
+  if ((s.volumes || []).length) {
+    L.push('volumes:');
+    (s.volumes || []).forEach(v => {
+      L.push('  ' + yScalar(v.name) + ':');
+      if ((v.driver || '').trim()) L.push('    driver: ' + yScalar(v.driver.trim()));
+      const opts = (v.driverOpts || []).filter(o => (o.key || '').trim());
+      if (opts.length) {
+        L.push('    driver_opts:');
+        opts.forEach(o => L.push('      ' + yScalar(o.key.trim()) + ': ' + yScalar(o.value)));
+      }
+    });
+  }
+
+  if ((s.networks || []).length) {
+    L.push('networks:');
+    (s.networks || []).forEach(nt => {
+      L.push('  ' + yScalar(nt.name) + ':');
+      if ((nt.driver || '').trim()) L.push('    driver: ' + yScalar(nt.driver.trim()));
+      if ((nt.subnet || '').trim()) {
+        L.push('    ipam:');
+        L.push('      config:');
+        L.push('        - subnet: ' + yScalar(nt.subnet.trim()));
+      }
+    });
+  }
+  return L.join('\n') + '\n';
+}
+
+/* ═══ 7 · Generator: Dockerfile ═════════════════════════════════════════════ */
+
+function dfExecArg(a){
+  return '"' + String(a).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+function dQuoteIf(v){
+  const s = String(v == null ? '' : v);
+  if (s === '') return '""';
+  if (/[\s"]/.test(s)) return '"' + s.replace(/"/g, '\\"') + '"';
+  return s;
+}
+
+/* RUN chains: split on newlines / “&&”; keep short chains on one line,
+   wrap longer ones with trailing “\” continuations (~120 char target). */
+function wrapRun(cmd){
+  const segs = String(cmd == null ? '' : cmd).split(/\n+|&&/).map(x => x.trim()).filter(Boolean);
+  if (!segs.length) return [];
+  const one = 'RUN ' + segs.join(' && ');
+  if (one.length <= 120) return [one];
+  return segs.map((sg, i) => (i === 0 ? 'RUN ' : '    ') + sg + (i < segs.length - 1 ? ' && \\' : ''));
+}
+
+function emitStep(st, s){
+  const t = st.type;
+  if (t === 'RUN') return wrapRun(st.command);
+  if (t === 'WORKDIR') {
+    const p = (st.path || '').trim();
+    return p ? ['WORKDIR ' + p] : [];
+  }
+  if (t === 'COPY') {
+    const src = (st.src || '').trim();
+    if (!src) return [];
+    const flags = [];
+    const from = (st.from || '').trim();
+    const stages = (s.docker && s.docker.multiStage && s.docker.stages) ? s.docker.stages : [];
+    if (from && stages.some(x => (x.name || '').trim() === from)) flags.push('--from=' + from);
+    if ((st.chown || '').trim()) flags.push('--chown=' + st.chown.trim());
+    const dest = (st.dest || '').trim() || '.';
+    return ['COPY' + (flags.length ? ' ' + flags.join(' ') : '') + ' ' + src + ' ' + dest];
+  }
+  if (t === 'ENV') {
+    const rows = (st.pairs || []).filter(p => (p.key || '').trim());
+    if (!rows.length) return [];
+    return rows.map(p => 'ENV ' + p.key.trim() + '=' + dQuoteIf(p.value));
+  }
+  if (t === 'ARG') {
+    const rows = (st.pairs || []).filter(p => (p.key || '').trim());
+    if (!rows.length) return [];
+    return rows.map(p => {
+      const v = (p.value == null ? '' : String(p.value)).trim();
+      return v ? 'ARG ' + p.key.trim() + '=' + dQuoteIf(v) : 'ARG ' + p.key.trim();
+    });
+  }
+  if (t === 'EXPOSE') {
+    const port = (st.port || '').trim();
+    return port ? ['EXPOSE ' + port + (st.proto === 'udp' ? '/udp' : '')] : [];
+  }
+  if (t === 'USER') {
+    const u = (st.user || '').trim();
+    return u ? ['USER ' + u] : [];
+  }
+  if (t === 'CMD' || t === 'ENTRYPOINT') {
+    if (st.mode === 'exec') {
+      const args = String(st.exec || '').split('\n').map(x => x.trim()).filter(Boolean);
+      return args.length ? [t + ' [' + args.map(dfExecArg).join(', ') + ']'] : [];
+    }
+    const sh = (st.shell || '').trim();
+    return sh ? [t + ' ' + sh] : [];
+  }
+  if (t === 'HEALTHCHECK') {
+    if (st.mode === 'none') return ['HEALTHCHECK NONE'];
+    const test = (st.test || '').trim();
+    if (!test) return [];
+    const flags = [];
+    if ((st.interval || '').trim()) flags.push('--interval=' + st.interval.trim());
+    if ((st.timeout || '').trim()) flags.push('--timeout=' + st.timeout.trim());
+    if ((st.retries || '').trim()) flags.push('--retries=' + st.retries.trim());
+    const body = /^CMD\b/i.test(test) ? test : 'CMD ' + test;
+    return ['HEALTHCHECK' + (flags.length ? ' ' + flags.join(' ') : '') + ' ' + body];
+  }
+  return [];
+}
+
+function genDockerfile(s){
+  const d = s.docker || {};
+  const L = [];
+  const emitSteps = steps => (steps || []).forEach(st => emitStep(st, s).forEach(l => L.push(l)));
+  if (d.multiStage && (d.stages || []).length) {
+    d.stages.forEach((st, i) => {
+      if (i) L.push('');
+      const base = (st.baseImage || '').trim() || 'scratch';
+      const name = (st.name || '').trim();
+      L.push('FROM ' + base + (name ? ' AS ' + name : ''));
+      emitSteps(st.steps);
+    });
+  } else {
+    L.push('FROM ' + ((d.singleBaseImage || '').trim() || 'scratch'));
+    emitSteps(d.steps);
+  }
+  return L.join('\n') + '\n';
+}
+
+/* ═══ 8 · Generator: docker run (primary service) ═══════════════════════════ */
+
+function genRun(s){
+  const svc = (s.services || [])[0];
+  if (!svc) return '';
+  const parts = ['docker run'];
+  const nm = (svc.containerName || '').trim();
+  if (nm) parts.push('--name ' + nm);
+  (svc.ports || []).filter(p => (p.host || '').trim() && (p.container || '').trim())
+    .forEach(p => parts.push('-p ' + p.host.trim() + ':' + p.container.trim() + (p.proto === 'udp' ? '/udp' : '')));
+  (svc.volumeMounts || []).filter(m => (m.volume || '').trim() && (m.target || '').trim())
+    .forEach(m => parts.push('-v ' + m.volume.trim() + ':' + String(m.target).trim() + (m.readonly ? ':ro' : '')));
+  (svc.env || []).filter(e => (e.key || '').trim())
+    .forEach(e => parts.push('-e ' + dfExecArg(e.key.trim() + '=' + String(e.value == null ? '' : e.value))));
+  (svc.networks || []).forEach(n => parts.push('--network ' + n));
+  if (svc.restart && svc.restart !== 'no') parts.push('--restart ' + svc.restart);
+  const img = svc.source === 'image' ? (svc.image || '').trim() : (svc.name || 'app').trim() + ':latest';
+  if (img) parts.push(img);
+  const cmd = (svc.command || '').trim();
+  if (cmd) {
+    const ex = parseExecJson(cmd);
+    if (ex) ex.forEach(a => parts.push(dfExecArg(a)));
+    else parts.push(cmd);
+  }
+  return parts.join(' ');
+}
+
+/* ═══ 9 · Validator ═════════════════════════════════════════════════════════ */
+
+function validateState(s){
+  const E = [], W = [];
+  const err = (path, msg) => E.push({ path, msg });
+
+  const d = s.docker || {};
+  /* E1 + stage structure */
+  if (d.multiStage) {
+    const stages = d.stages || [];
+    if (!stages.length) E.push({ msg: 'Multi-stage is on but no stage is defined — add a stage or switch it off.' });
+    stages.forEach((st, i) => {
+      if (!(st.baseImage || '').trim()) err('docker.stages.' + i + '.baseImage', 'Stage "' + ((st.name || '').trim() || 'Stage ' + (i + 1)) + '": base image is required.');
+      const nm = (st.name || '').trim();
+      if (!nm) err('docker.stages.' + i + '.name', 'Stage name is required.');
+      else {
+        if (!IDENT.test(nm)) err('docker.stages.' + i + '.name', 'Stage names use [A-Za-z0-9][A-Za-z0-9_.-]*.');
+      }
+    });
+    const seen = new Set();
+    stages.forEach((st, i) => {
+      const nm = (st.name || '').trim();
+      if (nm && seen.has(nm)) err('docker.stages.' + i + '.name', 'Duplicate stage name "' + nm + '".');
+      if (nm) seen.add(nm);
+      const earlier = stages.slice(0, i).map(x => (x.name || '').trim()).filter(Boolean);
+      (st.steps || []).forEach((step, si) => {
+        if (step.type === 'COPY') {
+          const from = (step.from || '').trim();
+          if (from && !earlier.includes(from)) err('docker.stages.' + i + '.steps.' + si + '.from', 'COPY --from target "' + from + '" is not an earlier stage.');
+        }
+      });
+    });
+  } else if (!(d.singleBaseImage || '').trim()) {
+    err('docker.singleBaseImage', 'Base image is required (e.g. node:20-alpine).');
+  }
+
+  /* E2 + services */
+  const svcs = s.services || [];
+  if (!svcs.length) E.push({ msg: 'Define at least one service in the Compose section.' });
+  const svcNames = svcs.map(x => (x.name || '').trim());
+  const svcSet = new Set(svcNames);
+  const volSet = new Set((s.volumes || []).map(v => (v.name || '').trim()));
+  const netSet = new Set((s.networks || []).map(n => (n.name || '').trim()));
+
+  svcs.forEach((svc, i) => {
+    const nm = (svc.name || '').trim();
+    if (!nm) err('services.' + i + '.name', 'Service name is required.');
+    else {
+      if (!IDENT.test(nm)) err('services.' + i + '.name', 'Service names use [A-Za-z0-9][A-Za-z0-9_.-]*.');
+      if (svcNames.indexOf(nm) !== svcNames.lastIndexOf(nm)) err('services.' + i + '.name', 'Duplicate service name "' + nm + '".');
+    }
+    if (svc.source === 'image') {
+      if (!(svc.image || '').trim()) err('services.' + i + '.image', 'Image is required when the source is "image" (or switch the source to "build").');
+    } else {
+      if (!(svc.buildPath || '').trim()) err('services.' + i + '.buildPath', 'Build context path is required (use "." for the project root).');
+      if (!(svc.buildDockerfile || '').trim()) W.push({ msg: 'Build Dockerfile name is empty for service "' + nm + '" — Compose defaults to "Dockerfile".' });
+    }
+    (svc.ports || []).forEach((p, pi) => {
+      const host = (p.host || '').trim(), cont = (p.container || '').trim();
+      if (!host && !cont) return;
+      if (!/^\d+$/.test(host)) err('services.' + i + '.ports.' + pi + '.host', 'Host port must be all digits (mappings look like 3000:3000).');
+      if (!/^\d+$/.test(cont)) err('services.' + i + '.ports.' + pi + '.container', 'Container port must be all digits (mappings look like 3000:3000).');
+    });
+    (svc.dependsOn || []).forEach(n => {
+      if (!svcSet.has(n)) err('services.' + i + '.dependsOn', 'depends_on references "' + n + '", which is not a defined service.');
+    });
+    (svc.volumeMounts || []).forEach((m, mi) => {
+      const vol = (m.volume || '').trim(), tgt = (m.target || '').trim();
+      if (!vol && !tgt) return;
+      if (!vol) err('services.' + i + '.volumeMounts.' + mi + '.volume', 'Pick a declared volume (or add one in the Volumes section).');
+      else if (!volSet.has(vol)) err('services.' + i + '.volumeMounts.' + mi + '.volume', 'Volume "' + vol + '" is not declared in the Volumes section.');
+      if (!tgt && vol) err('services.' + i + '.volumeMounts.' + mi + '.target', 'Mount target path is required (e.g. /data).');
+    });
+    (svc.networks || []).forEach(n => {
+      if (!netSet.has(n)) err('services.' + i + '.networks', 'Network "' + n + '" is not declared in the Networks section.');
+    });
+    if (svc.healthcheck && svc.healthcheck.enabled && !(svc.healthcheck.test || '').trim()) {
+      err('services.' + i + '.healthcheck.test', 'Healthcheck test command is required when the healthcheck is enabled.');
+    }
+  });
+
+  /* E5 / E6 — volumes & networks */
+  const vols = s.volumes || [];
+  const volNames = vols.map(v => (v.name || '').trim());
+  vols.forEach((v, i) => {
+    const nm = (v.name || '').trim();
+    if (!nm) err('volumes.' + i + '.name', 'Volume name is required.');
+    else {
+      if (!IDENT.test(nm)) err('volumes.' + i + '.name', 'Volume names use [A-Za-z0-9][A-Za-z0-9_.-]*.');
+      if (volNames.indexOf(nm) !== volNames.lastIndexOf(nm)) err('volumes.' + i + '.name', 'Duplicate volume name "' + nm + '".');
+    }
+  });
+  const nets = s.networks || [];
+  const netNames = nets.map(n => (n.name || '').trim());
+  nets.forEach((nt, i) => {
+    const nm = (nt.name || '').trim();
+    if (!nm) err('networks.' + i + '.name', 'Network name is required.');
+    else {
+      if (!IDENT.test(nm)) err('networks.' + i + '.name', 'Network names use [A-Za-z0-9][A-Za-z0-9_.-]*.');
+      if (netNames.indexOf(nm) !== netNames.lastIndexOf(nm)) err('networks.' + i + '.name', 'Duplicate network name "' + nm + '".');
+    }
+  });
+
+  /* Warnings */
+  if (!s.version) W.push({ msg: 'Compose "version" key is omitted — modern Compose ignores it (informational).' });
+  const keys = new Set((s.dotenv || []).map(e => (e.key || '').trim()).filter(Boolean));
+  const used = new Set();
+  const scan = t => {
+    String(t == null ? '' : t).replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (m, n) => { used.add(n); return m; });
+  };
+  svcs.forEach(svc => {
+    (svc.env || []).forEach(e => scan(e.value));
+    scan(svc.command);
+    if (svc.healthcheck && svc.healthcheck.enabled) scan(svc.healthcheck.test);
+  });
+  const missing = [];
+  used.forEach(k => { if (!keys.has(k)) missing.push(k); });
+  missing.sort();
+  if (missing.length) W.push({ type: 'envref', keys: missing, msg: 'Referenced in Compose but missing from .env: ' + missing.map(k => '${' + k + '}').join(', ') + '.' });
+
+  return { errors: E, warnings: W };
+}
+
+/* ═══ 10 · Highlighters (hand-rolled tokenizers) ════════════════════════════ */
+
+function classifyScalar(raw){
+  const s = raw.trim();
+  if (!s) return '';
+  if (/^(y|Y|n|N|yes|no|true|false|on|off|null|~)$/i.test(s)) return 'tk-bool';
+  if (/^[+-]?(\d[\d_]*(\.\d*)?([eE][+-]?\d+)?|\.\d+|(\d[\d_]*)?\.(\d+|inf)|\.nan)$/.test(s)) return 'tk-num';
+  return '';
+}
+
+function tokenizeYamlLine(line){
+  const toks = [];
+  let last = 0, pos = 0;
+  const n = line.length;
+  const flush = cls => { if (pos > last) toks.push({ t: line.slice(last, pos), c: cls || '' }); last = pos; };
+  const skipWS = () => { while (pos < n && (line[pos] === ' ' || line[pos] === '\t')) pos++; };
+
+  skipWS(); flush();
+  if (line[pos] === '#') { pos = n; flush('tk-com'); return toks; }
+  if (line[pos] === '-' && (n - pos === 1 || line[pos + 1] === ' ' || line[pos + 1] === '\t')) { pos++; flush('tk-dash'); }
+  skipWS(); flush();
+  if (pos >= n) return toks;
+
+  /* key: an unquoted “:” followed by whitespace or end-of-line */
+  let k = pos, q = null, colon = -1;
+  while (k < n) {
+    const ch = line[k];
+    if (q) {
+      if (ch === '\\' && q === '"') { k++; }
+      else if (ch === q) { q = null; }
+    } else if (ch === '"' || ch === "'") { q = ch; }
+    else if (ch === '#' && (k === 0 || line[k - 1] === ' ' || line[k - 1] === '\t')) { break; }
+    else if (ch === ':' && (k + 1 >= n || line[k + 1] === ' ' || line[k + 1] === '\t')) { colon = k; break; }
+    k++;
+  }
+  if (colon >= 0) {
+    pos = colon; flush('tk-key');
+    pos = colon + 1; skipWS(); flush('tk-col');   /* “:␣␣” as one dim token */
+    if (pos >= n) return toks;
+    if (line[pos] === '#') { pos = n; flush('tk-com'); return toks; }
+  } else if (k < n && line[k] === '#') {
+    pos = k; flush();
+    pos = n; flush('tk-com');
+    return toks;
+  }
+  if (pos >= n) return toks;
+
+  /* value */
+  const ch0 = line[pos];
+  if (ch0 === '"' || ch0 === "'") {
+    let e = pos + 1;
+    while (e < n) {
+      if (ch0 === '"' && line[e] === '\\') { e += 2; continue; }
+      if (line[e] === ch0) { e++; break; }
+      e++;
+    }
+    if (e > n) e = n;
+    pos = e; flush('tk-str');
+    skipWS(); flush();
+    if (line[pos] === '#') { pos = n; flush('tk-com'); return toks; }
+    pos = n; flush();
+    return toks;
+  }
+  /* plain scalar, stops at an unquoted “ #” */
+  let end = pos;
+  while (end < n && !(line[end] === '#' && (end === 0 || line[end - 1] === ' ' || line[end - 1] === '\t'))) end++;
+  const raw = line.slice(pos, end);
+  pos = end;
+  flush(raw.trim() === '' ? '' : classifyScalar(raw));
+  if (end < n) { pos = n; flush('tk-com'); }
+  return toks;
+}
+
+const DL_INSTR = new Set(['FROM','RUN','CMD','COPY','WORKDIR','ENV','ARG','EXPOSE','USER','ENTRYPOINT','HEALTHCHECK','LABEL','MAINTAINER','VOLUME','SHELL','STOPSIGNAL','ONBUILD']);
+
+function tokenizeDockerfileLine(line){
+  const toks = [];
+  let last = 0, pos = 0;
+  const n = line.length;
+  const flush = cls => { if (pos > last) toks.push({ t: line.slice(last, pos), c: cls || '' }); last = pos; };
+  const skipWS = () => { while (pos < n && (line[pos] === ' ' || line[pos] === '\t')) pos++; };
+
+  skipWS(); flush();
+  if (line[pos] === '#') { pos = n; flush('tk-com'); return toks; }
+  if (pos >= n) { pos = n; flush(); return toks; }
+
+  const m = /^[A-Za-z]+/.exec(line.slice(pos));
+  if (m && DL_INSTR.has(m[0].toUpperCase())) {
+    pos += m[0].length; flush('tk-kw');
+  } else {
+    pos += (m ? m[0].length : 0); flush();
+  }
+
+  while (pos < n) {
+    const ch = line[pos];
+    if (ch === ' ' || ch === '\t') { skipWS(); flush(); continue; }
+    if (ch === '#') { pos = n; flush('tk-com'); break; }
+    if (ch === '"' || ch === "'") {
+      const q0 = ch; let e = pos + 1;
+      while (e < n) {
+        if (q0 === '"' && line[e] === '\\') { e += 2; continue; }
+        if (line[e] === q0) { e++; break; }
+        e++;
+      }
+      if (e > n) e = n;
+      pos = e; flush('tk-str');
+      continue;
+    }
+    if (ch === '-' && line[pos + 1] === '-') {
+      let e = pos + 2;
+      while (e < n && /[A-Za-z0-9_-]/.test(line[e])) e++;
+      if (line[e] === '=') {
+        e++;
+        if (line[e] === '"' || line[e] === "'") {
+          const q0 = line[e]; let f = e + 1;
+          while (f < n) {
+            if (q0 === '"' && line[f] === '\\') { f += 2; continue; }
+            if (line[f] === q0) { f++; break; }
+            f++;
+          }
+          if (f > n) f = n;
+          e = f;
+        } else {
+          while (e < n && !/\s/.test(line[e])) e++;
+        }
+      }
+      pos = e; flush('tk-flag');
+      continue;
+    }
+    if (ch === 'A' && line.slice(pos, pos + 2) === 'AS' && (pos + 2 >= n || /\s/.test(line[pos + 2]))) {
+      pos += 2; flush('tk-kw');
+      continue;
+    }
+    /* plain run until the next token start or whitespace */
+    let k2 = pos + 1;
+    while (k2 < n) {
+      const c = line[k2];
+      if (/\s/.test(c) || c === '#' || c === '"' || c === "'") break;
+      if (c === '-' && line[k2 + 1] === '-') break;
+      if (c === 'A' && line.slice(k2, k2 + 2) === 'AS' && (k2 + 2 >= n || /\s/.test(line[k2 + 2]))) break;
+      k2++;
+    }
+    pos = k2; flush();
+  }
+  return toks;
+}
+
+// __PURE_END__
+
+/* ═══ 11 · DOM helpers ══════════════════════════════════════════════════════ */
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function h(tag, attrs){
+  const el = document.createElement(tag);
+  if (attrs) for (const k in attrs) {
+    const v = attrs[k];
+    if (v === undefined || v === null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'for') el.htmlFor = v;
+    else if (k === 'value') el.value = String(v);
+    else if (k === 'checked') el.checked = !!v;
+    else if (k === 'selected') el.selected = !!v;
+    else if (k === 'hidden') el.hidden = !!v;
+    else if (k === 'disabled') el.disabled = !!v;
+    else if (k === 'draggable') el.draggable = !!v;
+    else if (k === 'tabindex') el.tabIndex = +v;
+    else el.setAttribute(k, String(v === true ? '' : v));
+  }
+  for (let i = 2; i < arguments.length; i++) {
+    const add = c => {
+      if (c == null || c === false) return;
+      if (Array.isArray(c)) { c.forEach(add); return; }
+      if (c instanceof Node) el.appendChild(c);
+      else el.appendChild(document.createTextNode(String(c)));
+    };
+    add(arguments[i]);
+  }
+  return el;
+}
+
+const ICON_PATHS = {
+  dockerfile: ['M6 3h8l4 4v14H6z', 'M14 3v4h4', 'M9.5 12h5', 'M9.5 15.5h5'],
+  compose: ['M4 4h7v6H4z', 'M13 4h7v6h-7z', 'M4 14h7v6H4z', 'M13 14h7v6h-7z'],
+  volume: ['M12 4c4.4 0 8 1.2 8 2.6S16.4 9.2 12 9.2 4 8 4 6.6 7.6 4 12 4z', 'M4 6.6V17.4C4 18.8 7.6 20 12 20s8-1.2 8-2.6V6.6', 'M4 12c0 1.4 3.6 2.6 8 2.6s8-1.2 8-2.6'],
+  network: ['M9.5 5.5a2.5 2.5 0 1 0 5 0 2.5 2.5 0 0 0 -5 0z', 'M2.5 18.5a2.5 2.5 0 1 0 5 0 2.5 2.5 0 0 0 -5 0z', 'M16.5 18.5a2.5 2.5 0 1 0 5 0 2.5 2.5 0 0 0 -5 0z', 'M12 8v4.5M12 12.5l-6.6 4M12 12.5l6.6 4'],
+  envkey: ['M7.5 12a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9z', 'M10.8 14.2 20 5', 'M16.5 3.5H21V8'],
+  plus: ['M12 5v14', 'M5 12h14'],
+  trash: ['M4 6h16', 'M9 6V4h6v2', 'M6 6l1 14h10l1-14', 'M10 10v7', 'M14 10v7'],
+  grip: ['M9.5 5.5v.02', 'M9.5 12v.02', 'M9.5 18.5v.02', 'M14.5 5.5v.02', 'M14.5 12v.02', 'M14.5 18.5v.02'],
+  up: ['M6 14l6-6 6 6'],
+  down: ['M6 10l6 6 6-6'],
+  warn: ['M12 4 3 20h18z', 'M12 10.5V15', 'M12 17.5v.02']
+};
+
+function icon(name, size){
+  const paths = ICON_PATHS[name] || [];
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', String(size || 14));
+  svg.setAttribute('height', String(size || 14));
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  paths.forEach(d => {
+    const p = document.createElementNS(SVG_NS, 'path');
+    p.setAttribute('d', d);
+    svg.appendChild(p);
+  });
+  return svg;
+}
+
+function debounce(fn, ms){
+  let t = null;
+  return function(){ clearTimeout(t); t = setTimeout(fn, ms); };
+}
+
+/* ═══ 12 · State persistence ════════════════════════════════════════════════ */
+
+const LS_STATE = 'docker-ui-state-v2';
+const LS_THEME = 'docker-ui-theme';
+const memStorage = {};
+
+function lsGet(k){
+  try { return window.localStorage.getItem(k); } catch (_) { return Object.prototype.hasOwnProperty.call(memStorage, k) ? memStorage[k] : null; }
+}
+function lsSet(k, v){
+  try { window.localStorage.setItem(k, v); } catch (_) { memStorage[k] = v; }
+}
+
+function loadState(){
+  const raw = lsGet(LS_STATE);
+  if (raw) {
+    try {
+      const s = JSON.parse(raw);
+      if (s && typeof s === 'object' && s.schema === STORAGE_SCHEMA && s.docker) return normalize(s);
+    } catch (_) { /* corrupt → fall through to seed */ }
+  }
+  return seedState();
+}
+
+/* ═══ 13 · Global state & DOM refs ══════════════════════════════════════════ */
+
+let state = loadState();
+let validation = { errors: [], warnings: [] };
+let gen = { dockerfile: '', compose: '', run: '' };
+let lastStatus = '';
+let fieldSeq = 0, errSeq = 0, dragCtx = null;
+
+const formPanel = document.getElementById('form-panel');
+const navEl = document.getElementById('nav');
+const statusEl = document.getElementById('pv-status');
+const bannersEl = document.getElementById('pv-banners');
+const codeDf = document.getElementById('code-dockerfile');
+const codeCo = document.getElementById('code-compose');
+const panelDf = document.getElementById('view-dockerfile');
+const panelCo = document.getElementById('view-compose');
+const btnCopy = document.getElementById('btn-copy-tab');
+const btnDownload = document.getElementById('btn-download');
+const btnRunCopy = document.getElementById('btn-copy-run');
+const toastEl = document.getElementById('toast');
+
+const SECTIONS = [
+  { id: 'image',    label: 'Image (Dockerfile)', icon: 'dockerfile' },
+  { id: 'compose',  label: 'Compose',            icon: 'compose' },
+  { id: 'volumes',  label: 'Volumes',            icon: 'volume' },
+  { id: 'networks', label: 'Networks',           icon: 'network' },
+  { id: 'env',      label: 'Environment',        icon: 'envkey' }
+];
+
+const RESTART_OPTIONS = [['', '(not set)'], ['no', 'no'], ['always', 'always'], ['on-failure', 'on-failure'], ['unless-stopped', 'unless-stopped']];
+
+/* ═══ 14 · Field builders ═══════════════════════════════════════════════════ */
+
+function nextId(){ return 'dui-f' + (++fieldSeq); }
+function dset(el, key, val){ el.dataset[key] = val; return el; }
+
+function fld(label, control, hint){
+  if (!control.id) control.id = nextId();
+  const w = h('div', { class: 'field' });
+  w.appendChild(h('label', { for: control.id }, label));
+  w.appendChild(control);
+  if (hint) w.appendChild(h('div', { class: 'hint' }, hint));
+  return w;
+}
+
+function txt(label, o){
+  const el = h('input', { type: 'text', class: 'inp' + (o.cls ? ' ' + o.cls : ''), value: o.value == null ? '' : o.value, placeholder: o.placeholder || '', spellcheck: 'false', autocomplete: 'off' });
+  if (o.list) el.setAttribute('list', o.list);
+  dset(el, 'field', o.path);
+  return fld(label, el, o.hint);
+}
+
+function bareTxt(o){
+  const el = h('input', { type: 'text', class: 'inp' + (o.cls ? ' ' + o.cls : ''), value: o.value == null ? '' : o.value, placeholder: o.placeholder || '', 'aria-label': o.aria || o.placeholder || 'value', spellcheck: 'false', autocomplete: 'off' });
+  if (o.list) el.setAttribute('list', o.list);
+  dset(el, 'field', o.path);
+  return el;
+}
+
+function tta(label, o){
+  const el = h('textarea', { class: 'inp' + (o.cls ? ' ' + o.cls : ''), rows: o.rows || 2, placeholder: o.placeholder || '', spellcheck: 'false' });
+  el.value = o.value == null ? '' : o.value;
+  dset(el, 'field', o.path);
+  return fld(label, el, o.hint);
+}
+
+function tsel(label, o){
+  const el = h('select', { class: 'inp' + (o.cls ? ' ' + o.cls : ''), 'aria-label': undefined });
+  (o.options || []).forEach(([v, t]) => {
+    const opt = h('option', { value: v }, t);
+    if (v === (o.value == null ? '' : o.value)) opt.selected = true;
+    el.appendChild(opt);
+  });
+  dset(el, 'field', o.path);
+  if (o.re) dset(el, 're', o.re);
+  return fld(label, el, o.hint);
+}
+
+function bareSel(o){
+  const el = h('select', { class: 'inp' + (o.cls ? ' ' + o.cls : ''), 'aria-label': o.aria || 'select' });
+  (o.options || []).forEach(([v, t]) => {
+    const opt = h('option', { value: v }, t);
+    if (v === (o.value == null ? '' : o.value)) opt.selected = true;
+    el.appendChild(opt);
+  });
+  dset(el, 'field', o.path);
+  if (o.re) dset(el, 're', o.re);
+  return el;
+}
+
+function tchk(label, o){
+  const el = h('input', { type: 'checkbox', class: 'chk' });
+  el.checked = !!o.value;
+  dset(el, 'field', o.path);
+  if (o.re) dset(el, 're', o.re);
+  if (o.wrap === false) return el;
+  return labelWrap(label, el, o.hint);
+}
+
+function labelWrap(label, el, hint){
+  const w = h('div', { class: 'field' });
+  w.appendChild(h('label', { class: 'toggle-label', for: el.id || (el.id = nextId()) }, el, h('span', null, label)));
+  if (hint) w.appendChild(h('div', { class: 'hint' }, hint));
+  return w;
+}
+
+function radios(label, o){
+  const w = h('div', { class: 'field radio-group' });
+  w.setAttribute('role', 'group');
+  w.setAttribute('aria-label', label);
+  if (!o.noVisibleLabel) w.appendChild(h('span', { class: 'flabel' }, label));
+  const gid = nextId();
+  (o.options || []).forEach(([v, t]) => {
+    const el = h('input', { type: 'radio', name: gid, value: v });
+    el.checked = (o.current === v);
+    dset(el, 'field', o.path);
+    if (o.re) dset(el, 're', o.re);
+    w.appendChild(h('label', { class: 'radio-opt' }, el, h('span', null, t)));
+  });
+  return w;
+}
+
+function checkGroup(label, listPath, names, selected, hint){
+  const w = h('div', { class: 'field check-group' });
+  dset(w, 'field', listPath);
+  w.setAttribute('role', 'group');
+  w.setAttribute('aria-label', label);
+  w.appendChild(h('span', { class: 'flabel' }, label));
+  const box = h('div', { class: 'radio-group' });
+  if (!names.length) box.appendChild(h('span', { class: 'hint' }, 'Nothing declared yet.'));
+  (names || []).forEach(nm => {
+    const el = h('input', { type: 'checkbox', class: 'chk' });
+    el.checked = (selected || []).includes(nm);
+    dset(el, 'field', listPath);
+    dset(el, 'checklist', nm);
+    box.appendChild(h('label', { class: 'radio-opt mono-lbl' }, el, h('span', null, nm)));
+  });
+  w.appendChild(box);
+  if (hint) w.appendChild(h('div', { class: 'hint' }, hint));
+  return w;
+}
+
+function hintLine(text){
+  return h('div', { class: 'hint' }, text);
+}
+
+/* ═══ 15 · Row controls & repeaters ═════════════════════════════════════════ */
+
+function updownDel(listPath, i, len, noun){
+  const c = h('div', { class: 'controls' });
+  c.appendChild(h('button', { type: 'button', class: 'btn btn-ico', disabled: i === 0 || undefined, 'data-action': 'up|' + listPath + '|' + i, 'aria-label': 'Move ' + noun + ' up', title: 'Move up' }, icon('up', 13)));
+  c.appendChild(h('button', { type: 'button', class: 'btn btn-ico', disabled: i === len - 1 || undefined, 'data-action': 'down|' + listPath + '|' + i, 'aria-label': 'Move ' + noun + ' down', title: 'Move down' }, icon('down', 13)));
+  c.appendChild(h('button', { type: 'button', class: 'btn btn-ico btn-danger', 'data-action': 'del|' + listPath + '|' + i, 'aria-label': 'Delete ' + noun, title: 'Delete' }, icon('trash', 13)));
+  return c;
+}
+
+function delBtn(listPath, i, noun){
+  return h('button', { type: 'button', class: 'btn btn-ico btn-danger', 'data-action': 'del|' + listPath + '|' + i, 'aria-label': 'Remove ' + noun, title: 'Remove' }, icon('trash', 13));
+}
+
+function addBtn(listPath, label){
+  return h('button', { type: 'button', class: 'btn btn-ghost btn-sm', 'data-action': 'add|' + listPath }, icon('plus', 13), h('span', null, label || 'Add'));
+}
+
+function repeatList(items, listPath, emptyText, rowFn, addLabel){
+  const wrap = h('div', { class: 'rep' });
+  const list = h('div', { class: 'rep-list' });
+  (items || []).forEach((item, i) => list.appendChild(rowFn(item, i)));
+  if (!(items || []).length && emptyText) list.appendChild(hintLine(emptyText));
+  wrap.appendChild(list);
+  wrap.appendChild(addBtn(listPath, addLabel));
+  return wrap;
+}
+
+function stepTypeSelect(cur, itemPath){
+  const el = h('select', { class: 'inp type-sel', 'aria-label': 'Instruction type' });
+  STEP_TYPES.forEach(t => {
+    const o = h('option', { value: t }, t);
+    if (t === cur) o.selected = true;
+    el.appendChild(o);
+  });
+  dset(el, 'field', itemPath + '.type');
+  dset(el, 're', 'section');
+  return el;
+}
+
+function stepRow(st, itemPath, listPath, i, len, stageIdx){
+  const li = h('li', { class: 'step-row' });
+  li.draggable = true;
+  li.setAttribute('data-draglist', listPath);
+  li.setAttribute('data-dragindex', String(i));
+  li.appendChild(h('span', { class: 'grip', title: 'Drag to reorder (↑ ↓ buttons work too)' }, icon('grip', 14)));
+  li.appendChild(stepTypeSelect(st.type, itemPath));
+  li.appendChild(stepFields(st, itemPath, stageIdx));
+  li.appendChild(updownDel(listPath, i, len, 'step'));
+  return li;
+}
+
+function stepsList(steps, listPath, stageIdx){
+  const wrap = h('div', { class: 'steps-wrap' });
+  const list = h('ul', { class: 'steps' });
+  (steps || []).forEach((st, i) => list.appendChild(stepRow(st, listPath + '.' + i, listPath, i, steps.length, stageIdx)));
+  if (!(steps || []).length) list.appendChild(hintLine('No steps yet — add the first one below.'));
+  wrap.appendChild(list);
+  wrap.appendChild(addBtn(listPath, 'Add step'));
+  return wrap;
+}
+
+function pairsBlock(pairs, listPath, keyPlaceholder, valuePlaceholder){
+  return repeatList(pairs, listPath, 'No pairs yet.', (p, i) =>
+    h('div', { class: 'rep-row' },
+      bareTxt({ path: listPath + '.' + i + '.key', value: p.key, placeholder: keyPlaceholder, aria: 'Key', cls: 'mono' }),
+      bareTxt({ path: listPath + '.' + i + '.value', value: p.value == null ? '' : p.value, placeholder: valuePlaceholder, aria: 'Value', cls: 'mono' }),
+      h('div', { class: 'controls' }, delBtn(listPath, i, 'pair'))
+    ), 'Add pair');
+}
+
+function stepFields(st, lp, stageIdx){
+  const f = h('div', { class: 'step-fields' });
+  const T = st.type;
+  if (T === 'RUN') {
+    f.appendChild(txt('Command', { path: lp + '.command', value: st.command, placeholder: 'apt-get update && apt-get install -y git', cls: 'mono' }));
+    f.appendChild(hintLine('One instruction is emitted per step. “&&” chains and newlines wrap with a trailing “\\” once the line exceeds ~120 characters.'));
+  } else if (T === 'COPY') {
+    f.appendChild(h('div', { class: 'row3' },
+      txt('Source', { path: lp + '.src', value: st.src, placeholder: './src' }),
+      txt('Destination', { path: lp + '.dest', value: st.dest, placeholder: '/app/src' }),
+      txt('--chown (optional)', { path: lp + '.chown', value: st.chown, placeholder: '1000:1000', cls: 'mono' })));
+    if (state.docker.multiStage) {
+      const earlier = (state.docker.stages || []).slice(0, Math.max(stageIdx, 0))
+        .map(x => (x.name || '').trim()).filter(Boolean)
+        .map(n => [n, n]);
+      if (earlier.length) {
+        f.appendChild(h('div', { class: 'row2' },
+          tsel('--from stage (optional)', { path: lp + '.from', value: st.from, options: [['', '(none)']].concat(earlier) }),
+          h('div', { class: 'field' }, h('span', { class: 'flabel' }, 'Only earlier stages can be used as COPY sources.'))));
+      }
+    }
+  } else if (T === 'WORKDIR') {
+    f.appendChild(txt('Path', { path: lp + '.path', value: st.path, placeholder: '/app' }));
+  } else if (T === 'ENV' || T === 'ARG') {
+    const bl = pairsBlock(st.pairs, lp + '.pairs', T === 'ARG' ? 'NAME' : 'KEY', T === 'ARG' ? 'default value (optional)' : 'value');
+    bl.lastChild && bl.lastChild.querySelector && null;
+    const label = h('span', { class: 'flabel' }, T === 'ARG' ? 'Arguments' : 'Variables');
+    const g = h('div', { class: 'group' });
+    g.appendChild(label);
+    g.appendChild(bl);
+    f.appendChild(g);
+  } else if (T === 'EXPOSE') {
+    f.appendChild(h('div', { class: 'row2' },
+      txt('Port or range', { path: lp + '.port', value: st.port, placeholder: '8080', cls: 'mono' }),
+      radios('Protocol', { path: lp + '.proto', current: st.proto || 'tcp', options: [['tcp', 'TCP'], ['udp', 'UDP']] })));
+  } else if (T === 'USER') {
+    f.appendChild(txt('User[:group]', { path: lp + '.user', value: st.user, placeholder: 'appuser' }));
+  } else if (T === 'CMD' || T === 'ENTRYPOINT') {
+    f.appendChild(radios('Form', { path: lp + '.mode', current: st.mode || 'shell', options: [['shell', 'Shell'], ['exec', 'Exec (JSON)']], re: 'section' }));
+    if ((st.mode || 'shell') === 'exec') {
+      f.appendChild(tta('Arguments — one per line', { path: lp + '.exec', value: st.exec, placeholder: 'node\nindex.js', rows: 2, cls: 'mono' }));
+    } else {
+      f.appendChild(txt('Command', { path: lp + '.shell', value: st.shell, placeholder: 'node index.js', cls: 'mono' }));
+    }
+  } else if (T === 'HEALTHCHECK') {
+    f.appendChild(radios('Mode', { path: lp + '.mode', current: st.mode || 'cmd', options: [['cmd', 'CMD'], ['none', 'NONE']], re: 'section' }));
+    if ((st.mode || 'cmd') === 'cmd') {
+      f.appendChild(txt('Test', { path: lp + '.test', value: st.test, placeholder: 'curl -f http://localhost:3000/ || exit 1' }));
+      f.appendChild(h('div', { class: 'row3' },
+        txt('Interval', { path: lp + '.interval', value: st.interval == null ? '30s' : st.interval, placeholder: '30s', cls: 'mono' }),
+        txt('Timeout', { path: lp + '.timeout', value: st.timeout == null ? '3s' : st.timeout, placeholder: '3s', cls: 'mono' }),
+        txt('Retries', { path: lp + '.retries', value: st.retries == null ? '3' : st.retries, placeholder: '3', cls: 'mono' })));
+    }
+  }
+  return f;
+}
+
+/* ═══ 16 · Section renderers ════════════════════════════════════════════════ */
+
+function secHeader(iconName, title, desc){
+  const head = h('div', null,
+    h('div', { class: 'sec-head' }, icon(iconName, 16), h('h2', null, title)),
+    desc ? h('p', { class: 'sec-desc' }, desc) : null
+  );
+  return head;
+}
+
+function renderImage(){
+  const d = state.docker;
+  const root = h('section', { class: 'sec' });
+  root.appendChild(secHeader('dockerfile', 'Image (Dockerfile)', 'Define the image build — it drives the Dockerfile preview tab.'));
+
+  const chk = h('input', { type: 'checkbox', class: 'chk', id: 'ms-toggle' });
+  chk.checked = !!d.multiStage;
+  dset(chk, 'field', 'docker.multiStage');
+  dset(chk, 're', 'section');
+  const tog = h('div', { class: 'field', style: 'margin-bottom:12px' },
+    h('label', { class: 'toggle-label', for: 'ms-toggle' }, chk, h('span', null, 'Enable multi-stage build')),
+    h('div', { class: 'hint' }, 'Emits FROM … AS stage blocks; COPY steps can then pull from earlier stages.'));
+  root.appendChild(tog);
+
+  if (d.multiStage) {
+    (d.stages || []).forEach((st, i) => {
+      const card = h('section', { class: 'card' });
+      const head = h('div', { class: 'card-head' });
+      head.appendChild(h('h3', null, 'Stage ' + (i + 1)));
+      head.appendChild(h('div', { class: 'spacer' }));
+      head.appendChild(updownDel('docker.stages', i, (d.stages || []).length, 'stage'));
+      card.appendChild(head);
+      card.appendChild(h('div', { class: 'row2' },
+        txt('Stage name', { path: 'docker.stages.' + i + '.name', value: st.name, placeholder: 'builder', cls: 'mono' }),
+        txt('Base image', { path: 'docker.stages.' + i + '.baseImage', value: st.baseImage, placeholder: 'node:20-alpine', cls: 'mono', list: 'img-presets' })));
+      card.appendChild(stepsList(st.steps || [], 'docker.stages.' + i + '.steps', i));
+      root.appendChild(card);
+    });
+    root.appendChild(addBtn('docker.stages', 'Add stage'));
+  } else {
+    const card = h('div', { class: 'card' });
+    card.appendChild(h('div', { class: 'row2' },
+      txt('Base image', { path: 'docker.singleBaseImage', value: d.singleBaseImage, placeholder: 'node:20-alpine', cls: 'mono', list: 'img-presets' }),
+      h('div', { class: 'field' }, h('span', { class: 'flabel' }, 'Suggestions'), hintLine('Type to search the common-image list, or enter any registry path.'))));
+    card.appendChild(h('div', { class: 'group' },
+      h('span', { class: 'flabel' }, 'Build steps'),
+      stepsList(d.steps || [], 'docker.steps', -1)));
+    root.appendChild(card);
+  }
+  return root;
+}
+
+function renderCompose(){
+  const root = h('section', { class: 'sec' });
+  root.appendChild(secHeader('compose', 'Compose', 'Services and file-wide settings — they drive the docker-compose.yml preview tab.'));
+
+  root.appendChild(h('div', { class: 'row2' },
+    tsel('Compose file version', {
+      path: 'version', value: state.version,
+      options: [['3.8', '3.8'], ['3.9', '3.9'], ['2.4', '2.4'], ['', 'Omit version key']],
+      hint: 'Compose v2 ignores this key; “Omit” leaves it out (a warning, never an error).'
+    })));
+
+  (state.services || []).forEach((svc, i) => root.appendChild(serviceCard(svc, i)));
+  root.appendChild(addBtn('services', 'Add service'));
+  return root;
+}
+
+function serviceCard(svc, i){
+  const card = h('section', { class: 'card' });
+  const head = h('div', { class: 'card-head' });
+  head.appendChild(h('h3', null, 'Service ' + (i + 1)));
+  head.appendChild(h('div', { class: 'spacer' }));
+  head.appendChild(updownDel('services', i, state.services.length, 'service'));
+  card.appendChild(head);
+
+  card.appendChild(h('div', { class: 'row2' },
+    txt('Service name', { path: 'services.' + i + '.name', value: svc.name, placeholder: 'app', cls: 'mono' }),
+    txt('container_name (optional)', { path: 'services.' + i + '.containerName', value: svc.containerName, placeholder: 'defaults to the service name', cls: 'mono' })));
+
+  card.appendChild(radios('Source', {
+    path: 'services.' + i + '.source', current: svc.source,
+    options: [['image', 'Pull an image'], ['build', 'Build from a path']], re: 'section'
+  }));
+
+  if (svc.source === 'image') {
+    card.appendChild(txt('Image', { path: 'services.' + i + '.image', value: svc.image, placeholder: 'node:20-alpine', cls: 'mono', list: 'img-presets' }));
+  } else {
+    card.appendChild(h('div', { class: 'row3' },
+      txt('Build context path', { path: 'services.' + i + '.buildPath', value: svc.buildPath, placeholder: '.', cls: 'mono' }),
+      txt('Dockerfile name (optional)', { path: 'services.' + i + '.buildDockerfile', value: svc.buildDockerfile, placeholder: 'defaults to Dockerfile', cls: 'mono' }),
+      txt('Target stage (optional)', { path: 'services.' + i + '.buildTarget', value: svc.buildTarget, placeholder: 'e.g. builder', cls: 'mono', hint: 'Needs a multi-stage Dockerfile.' })));
+  }
+
+  card.appendChild(tsel('Restart policy', { path: 'services.' + i + '.restart', value: svc.restart, options: RESTART_OPTIONS, hint: '“no” is emitted quoted so YAML keeps it a string.' }));
+
+  /* Ports */
+  const pg = h('div', { class: 'group' });
+  pg.appendChild(h('span', { class: 'flabel' }, 'Port mappings (host : container)'));
+  pg.appendChild(repeatList(svc.ports, 'services.' + i + '.ports', 'No port mappings.', (p, pi) =>
+    h('div', { class: 'rep-row' },
+      bareTxt({ path: 'services.' + i + '.ports.' + pi + '.host', value: p.host, placeholder: '3000', aria: 'Host port', cls: 'mono' }),
+      bareTxt({ path: 'services.' + i + '.ports.' + pi + '.container', value: p.container, placeholder: '3000', aria: 'Container port', cls: 'mono' }),
+      bareSel({ path: 'services.' + i + '.ports.' + pi + '.proto', value: p.proto || 'tcp', aria: 'Protocol', options: [['tcp', 'TCP'], ['udp', 'UDP']] }),
+      updownDel('services.' + i + '.ports', pi, svc.ports.length, 'port mapping')
+    ), 'Add port mapping'));
+  pg.appendChild(hintLine('Rows map “host:container”; UDP rows get a /udp suffix.'));
+  card.appendChild(pg);
+
+  /* Depends on */
+  const others = state.services.filter((_, j) => j !== i).map(s => (s.name || '').trim()).filter(Boolean);
+  card.appendChild(checkGroup('depends_on — start after these services', 'services.' + i + '.dependsOn', others, svc.dependsOn,
+    'Compose waits for the listed service names.'));
+
+  /* Environment */
+  const eg = h('div', { class: 'group' });
+  eg.appendChild(h('span', { class: 'flabel' }, 'Environment (KEY : value rows)'));
+  eg.appendChild(repeatList(svc.env, 'services.' + i + '.env', 'No environment rows.', (e, ei) =>
+    h('div', { class: 'rep-row' },
+      bareTxt({ path: 'services.' + i + '.env.' + ei + '.key', value: e.key, placeholder: 'KEY_NAME', aria: 'Environment key', cls: 'mono' }),
+      bareTxt({ path: 'services.' + i + '.env.' + ei + '.value', value: e.value == null ? '' : e.value, placeholder: 'value or ${VAR}', aria: 'Environment value', cls: 'mono' }),
+      updownDel('services.' + i + '.env', ei, svc.env.length, 'environment row')
+    ), 'Add row'));
+  const loadBtn = h('button', { type: 'button', class: 'btn btn-ghost btn-sm', 'data-action': 'do|loadenv|' + i }, h('span', null, 'Load from .env'));
+  eg.appendChild(h('div', { class: 'rep-row' }, loadBtn));
+  eg.appendChild(hintLine('Values written as ${KEY} are resolved by Compose from the .env file at runtime (Environment section).'));
+  card.appendChild(eg);
+
+  /* Command override */
+  card.appendChild(txt('Command override (optional)', {
+    path: 'services.' + i + '.command', value: svc.command,
+    placeholder: 'node index.js  —  or exec form  ["node", "index.js"]', cls: 'mono',
+    hint: 'A JSON array literal is emitted as an exec-form list instead of a shell string.'
+  }));
+
+  /* Healthcheck */
+  card.appendChild(tchk('Enable healthcheck', { path: 'services.' + i + '.healthcheck.enabled', value: svc.healthcheck && svc.healthcheck.enabled, re: 'section' }));
+  if (svc.healthcheck && svc.healthcheck.enabled) {
+    const hg = h('div', { class: 'group' });
+    hg.appendChild(txt('Test', { path: 'services.' + i + '.healthcheck.test', value: svc.healthcheck.test, placeholder: 'curl -f http://localhost:3000/ || exit 1' }));
+    hg.appendChild(h('div', { class: 'row3' },
+      txt('Interval', { path: 'services.' + i + '.healthcheck.interval', value: svc.healthcheck.interval == null ? '30s' : svc.healthcheck.interval, placeholder: '30s', cls: 'mono' }),
+      txt('Timeout', { path: 'services.' + i + '.healthcheck.timeout', value: svc.healthcheck.timeout == null ? '3s' : svc.healthcheck.timeout, placeholder: '3s', cls: 'mono' }),
+      txt('Retries', { path: 'services.' + i + '.healthcheck.retries', value: svc.healthcheck.retries == null ? '3' : svc.healthcheck.retries, placeholder: '3', cls: 'mono' })));
+    card.appendChild(hg);
+  }
+
+  /* Volume mounts */
+  const vg = h('div', { class: 'group' });
+  vg.appendChild(h('span', { class: 'flabel' }, 'Volume mounts (from the Volumes section)'));
+  const volNames = (state.volumes || []).map(v => (v.name || '').trim()).filter(Boolean);
+  vg.appendChild(repeatList(svc.volumeMounts, 'services.' + i + '.volumeMounts', 'No mounts.', (m, mi) =>
+    h('div', { class: 'rep-row' },
+      bareSel({ path: 'services.' + i + '.volumeMounts.' + mi + '.volume', value: m.volume, aria: 'Declared volume', options: [['', '(pick volume)']].concat(volNames.map(v => [v, v])) }),
+      bareTxt({ path: 'services.' + i + '.volumeMounts.' + mi + '.target', value: m.target, placeholder: '/data', aria: 'Container mount path' }),
+      h('label', { class: 'radio-opt' }, tchk('Read-only', { path: 'services.' + i + '.volumeMounts.' + mi + '.readonly', value: m.readonly, wrap: false }), h('span', null, 'RO')),
+      updownDel('services.' + i + '.volumeMounts', mi, svc.volumeMounts.length, 'volume mount')
+    ), 'Add mount'));
+  if (!volNames.length) vg.appendChild(hintLine('No volumes declared yet — add them in the Volumes section.'));
+  card.appendChild(vg);
+
+  /* Networks */
+  const netNames = (state.networks || []).map(n => (n.name || '').trim()).filter(Boolean);
+  card.appendChild(checkGroup('networks — attach declared networks', 'services.' + i + '.networks', netNames, svc.networks,
+    netNames.length ? 'Attachments reference the declarations in the Networks section.' : 'Declarations live in the Networks section.'));
+
+  return card;
+}
+
+function renderVolumes(){
+  const root = h('section', { class: 'sec' });
+  root.appendChild(secHeader('volume', 'Volumes', 'Top-level named-volume declarations. Attach them to services in the Compose section; deleting one detaches it.'));
+  (state.volumes || []).forEach((v, i) => {
+    const card = h('section', { class: 'card' });
+    const head = h('div', { class: 'card-head' });
+    head.appendChild(h('h3', null, 'Volume ' + (i + 1)));
+    head.appendChild(h('div', { class: 'spacer' }));
+    head.appendChild(updownDel('volumes', i, state.volumes.length, 'volume'));
+    card.appendChild(head);
+    card.appendChild(h('div', { class: 'row2' },
+      txt('Name', { path: 'volumes.' + i + '.name', value: v.name, placeholder: 'app-data', cls: 'mono' }),
+      txt('Driver', { path: 'volumes.' + i + '.driver', value: v.driver == null ? 'local' : v.driver, placeholder: 'local', cls: 'mono' })));
+    const g = h('div', { class: 'group' });
+    g.appendChild(h('span', { class: 'flabel' }, 'driver_opts (key : value)'));
+    g.appendChild(repeatList(v.driverOpts, 'volumes.' + i + '.driverOpts', 'No driver options.', (o, oi) =>
+      h('div', { class: 'rep-row' },
+        bareTxt({ path: 'volumes.' + i + '.driverOpts.' + oi + '.key', value: o.key, placeholder: 'type', aria: 'Driver option key', cls: 'mono' }),
+        bareTxt({ path: 'volumes.' + i + '.driverOpts.' + oi + '.value', value: o.value == null ? '' : o.value, placeholder: 'none', aria: 'Driver option value' }),
+        updownDel('volumes.' + i + '.driverOpts', oi, v.driverOpts.length, 'driver option')
+      ), 'Add option'));
+    card.appendChild(g);
+    root.appendChild(card);
+  });
+  root.appendChild(addBtn('volumes', 'Add volume'));
+  return root;
+}
+
+function renderNetworks(){
+  const root = h('section', { class: 'sec' });
+  root.appendChild(secHeader('network', 'Networks', 'Top-level network declarations. Attach them to services in the Compose section; deleting one detaches it.'));
+  (state.networks || []).forEach((nt, i) => {
+    const card = h('section', { class: 'card' });
+    const head = h('div', { class: 'card-head' });
+    head.appendChild(h('h3', null, 'Network ' + (i + 1)));
+    head.appendChild(h('div', { class: 'spacer' }));
+    head.appendChild(updownDel('networks', i, state.networks.length, 'network'));
+    card.appendChild(head);
+    card.appendChild(h('div', { class: 'row3' },
+      txt('Name', { path: 'networks.' + i + '.name', value: nt.name, placeholder: 'webnet', cls: 'mono' }),
+      txt('Driver', { path: 'networks.' + i + '.driver', value: nt.driver == null ? 'bridge' : nt.driver, placeholder: 'bridge', cls: 'mono' }),
+      txt('Subnet (optional)', { path: 'networks.' + i + '.subnet', value: nt.subnet, placeholder: '172.16.10.0/16', cls: 'mono', hint: 'Emitted via ipam.config.' })));
+    root.appendChild(card);
+  });
+  root.appendChild(addBtn('networks', 'Add network'));
+  return root;
+}
+
+function renderEnv(){
+  const root = h('section', { class: 'sec' });
+  root.appendChild(secHeader('envkey', 'Environment (.env)', 'The .env file sits next to docker-compose.yml; Compose interpolates ${VAR} values from it at runtime.'));
+
+  const envWarn = (validation.warnings || []).filter(w => w.type === 'envref');
+  envWarn.forEach(w => {
+    root.appendChild(h('div', { class: 'banner banner-warn' }, icon('warn', 14),
+      h('div', null, h('strong', null, 'Referenced but undefined: '), w.msg)));
+  });
+
+  root.appendChild(h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h3', null, '.env key/value pairs')),
+    repeatList(state.dotenv, 'dotenv', 'No entries yet.', (e, ei) =>
+      h('div', { class: 'rep-row' },
+        bareTxt({ path: 'dotenv.' + ei + '.key', value: e.key, placeholder: 'KEY_NAME', aria: 'Variable key', cls: 'mono' }),
+        bareTxt({ path: 'dotenv.' + ei + '.value', value: e.value == null ? '' : e.value, placeholder: 'value', aria: 'Variable value' }),
+        updownDel('dotenv', ei, state.dotenv.length, '.env entry')
+      ), 'Add entry')));
+
+  const card = h('div', { class: 'card' });
+  card.appendChild(h('div', { class: 'card-head' }, h('h3', null, 'Paste import')));
+  const ta = h('textarea', { class: 'inp mono', rows: 6, id: 'env-paste', spellcheck: 'false', 'aria-label': 'Paste .env content to import', placeholder: 'KEY=value\nOTHER=with # hash\n# comments and blank lines are ignored' });
+  card.appendChild(ta);
+  card.appendChild(h('div', { class: 'rep-row', style: 'margin-top:8px' },
+    h('button', { type: 'button', class: 'btn btn-primary btn-sm', 'data-action': 'do|dotenv-import' }, h('span', null, 'Import into .env'))));
+  card.appendChild(hintLine('One KEY=VALUE per line. “#”/“!” comments, blank lines and “export ” prefixes are ignored; quotes and inner “#” are kept verbatim.'));
+  root.appendChild(card);
+  return root;
+}
+
+const SECTION_RENDERERS = { image: renderImage, compose: renderCompose, volumes: renderVolumes, networks: renderNetworks, env: renderEnv };
+
+/* ═══ 17 · Sidebar ══════════════════════════════════════════════════════════ */
+
+function renderNav(){
+  navEl.replaceChildren();
+  SECTIONS.forEach(s => {
+    const b = h('button', { type: 'button', class: 'nav-btn', 'data-nav': s.id, title: s.label }, icon(s.icon, 15), h('span', null, s.label));
+    navEl.appendChild(b);
+  });
+  updateNav();
+}
+
+function updateNav(){
+  Array.from(navEl.children).forEach(b => {
+    if (b.dataset.nav === state.activeSection) b.setAttribute('aria-current', 'true');
+    else b.removeAttribute('aria-current');
+  });
+}
+
+/* ═══ 18 · Preview ══════════════════════════════════════════════════════════ */
+
+function countLines(text){
+  if (!text) return 0;
+  const n = text.split('\n').length;
+  return text.endsWith('\n') ? n - 1 : n;
+}
+
+function highlightInto(codeEl, text, lang){
+  codeEl.replaceChildren();
+  const tok = lang === 'yaml' ? tokenizeYamlLine : tokenizeDockerfileLine;
+  const lines = String(text).split('\n');
+  lines.forEach((ln, idx) => {
+    tok(ln).forEach(t => {
+      const sp = document.createElement('span');
+      if (t.c) sp.className = t.c;
+      sp.textContent = t.t;
+      codeEl.appendChild(sp);
+    });
+    if (idx < lines.length - 1) codeEl.appendChild(document.createTextNode('\n'));
+  });
+}
+
+function renderBanners(){
+  bannersEl.replaceChildren();
+  if (validation.errors.length) {
+    const b = h('div', { class: 'banner banner-err', role: 'alert' }, icon('warn', 14),
+      h('div', null, h('strong', null, 'Fix ' + validation.errors.length + ' error' + (validation.errors.length === 1 ? '' : 's') + ' — Download is blocked.'),
+        h('div', { class: 'blist' },
+          validation.errors.slice(0, 20).map(e => h('div', null, '• ' + e.msg)).concat(
+            validation.errors.length > 20 ? [h('div', null, '… and ' + (validation.errors.length - 20) + ' more')] : []))));
+    bannersEl.appendChild(b);
+  }
+  if (validation.warnings.length) {
+    const b = h('div', { class: 'banner banner-warn' }, icon('warn', 14),
+      h('div', null, h('strong', null, validation.warnings.length + ' warning' + (validation.warnings.length === 1 ? '' : 's') + ':'),
+        h('div', { class: 'blist' },
+          validation.warnings.slice(0, 20).map(w => h('div', null, '• ' + w.msg)))));
+    bannersEl.appendChild(b);
+  }
+}
+
+function renderPreview(){
+  const isDf = state.activeTab !== 'compose';
+  const tabD = document.getElementById('tab-dockerfile');
+  const tabC = document.getElementById('tab-compose');
+  tabD.setAttribute('aria-selected', String(isDf)); tabD.tabIndex = isDf ? 0 : -1;
+  tabC.setAttribute('aria-selected', String(!isDf)); tabC.tabIndex = isDf ? -1 : 0;
+  panelDf.hidden = !isDf;
+  panelCo.hidden = isDf;
+
+  highlightInto(codeDf, gen.dockerfile, 'dockerfile');
+  highlightInto(codeCo, gen.compose, 'yaml');
+
+  const fname = isDf ? 'Dockerfile' : 'docker-compose.yml';
+  const lines = isDf ? countLines(gen.dockerfile) : countLines(gen.compose);
+  const E = validation.errors.length, W = validation.warnings.length;
+  const text = fname + ' · ' + lines + ' lines · ' + E + (E === 1 ? ' error' : ' errors') + (W ? ' · ' + W + (W === 1 ? ' warning' : ' warnings') : '');
+  if (text !== lastStatus) { lastStatus = text; statusEl.textContent = text; }
+
+  btnDownload.disabled = E > 0;
+  btnDownload.title = E ? 'Fix ' + E + ' validation error' + (E === 1 ? '' : 's') + ' to enable download' : 'Download ' + fname;
+  btnCopy.title = 'Copy ' + fname + ' to clipboard';
+  btnRunCopy.hidden = isDf;
+  btnRunCopy.disabled = !gen.run;
+  btnRunCopy.title = gen.run ? 'Copy a “docker run” command for the first service' : 'No service is defined yet';
+
+  renderBanners();
+}
+
+/* ═══ 19 · Copy / Download / Toast / Theme ══════════════════════════════════ */
+
+let toastTimer = null;
+function toast(msg){
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2400);
+}
+
+async function copyText(t, okMsg){
+  try {
+    await navigator.clipboard.writeText(t);
+    toast(okMsg || 'Copied to clipboard');
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) {}
+    ta.remove();
+    toast(ok ? (okMsg || 'Copied to clipboard') : 'Copy failed — select the preview text manually');
+  }
+}
+
+function downloadFile(name, text){
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 500);
+  toast('Downloading ' + name);
+}
+
+let toastTheme = null;
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('ico-sun').hidden = (t === 'light');  /* dark mode offers the switch to light */
+  document.getElementById('ico-moon').hidden = (t === 'dark');
+}
+
+/* ═══ 20 · Pipeline ═════════════════════════════════════════════════════════ */
+
+function persist(){
+  lsSet(LS_STATE, JSON.stringify(state));
+  lsSet(LS_THEME, state.theme);
+}
+
+function flush(withSectionRender){
+  validation = validateState(state);
+  gen.dockerfile = genDockerfile(state);
+  gen.compose = genCompose(state);
+  gen.run = genRun(state);
+  if (withSectionRender) renderSection();
+  applyErrors();
+  renderPreview();
+  persist();
+}
+
+let structQueued = false;
+function structural(){
+  if (structQueued) return;
+  structQueued = true;
+  queueMicrotask(() => { structQueued = false; flush(true); });
+}
+
+const schedule = debounce(() => flush(false), 150);
+
+function renderSection(){
+  formPanel.replaceChildren();
+  const fn = SECTION_RENDERERS[state.activeSection] || renderImage;
+  formPanel.appendChild(fn());
+}
+
+/* ═══ 21 · Inline error attachment ══════════════════════════════════════════ */
+
+function applyErrors(){
+  formPanel.querySelectorAll('.field-error').forEach(n => n.remove());
+  formPanel.querySelectorAll('[aria-invalid]').forEach(n => {
+    n.removeAttribute('aria-invalid');
+    n.removeAttribute('aria-describedby');
+  });
+  formPanel.querySelectorAll('.inv').forEach(n => n.classList.remove('inv'));
+
+  const byPath = {};
+  validation.errors.forEach(e => { if (e.path) (byPath[e.path] = byPath[e.path] || []).push(e.msg); });
+
+  Object.keys(byPath).forEach(path => {
+    const target = formPanel.querySelector('[data-field="' + path + '"]');
+    if (!target) return;
+    const wrap = target.matches('input,select,textarea')
+      ? (target.closest('.field') || target.closest('.rep-row') || target.parentElement || target)
+      : target;
+    wrap.classList.add('inv');
+    const errId = 'dui-err-' + (++errSeq);
+    wrap.appendChild(h('div', { class: 'field-error', id: errId }, byPath[path].join(' ')));
+    const ctl = wrap.matches('input,select,textarea') ? wrap : wrap.querySelector('input,select,textarea');
+    if (ctl) {
+      ctl.setAttribute('aria-invalid', 'true');
+      ctl.setAttribute('aria-describedby', errId);
+    }
+  });
+}
+
+/* ═══ 22 · Structural mutations & actions ═══════════════════════════════════ */
+
+function newItemFor(listPath){
+  const key = String(listPath).split('.').filter(x => !/^\d+$/.test(x)).pop();
+  const F = {
+    steps:        () => ({ id: uid(), type: 'RUN', command: '' }),
+    stages:       () => ({ id: uid(), name: '', baseImage: '', steps: [] }),
+    services:     () => newService(),
+    volumes:      () => ({ id: uid(), name: '', driver: 'local', driverOpts: [] }),
+    networks:     () => ({ id: uid(), name: '', driver: 'bridge', subnet: '' }),
+    ports:        () => ({ id: uid(), host: '', container: '', proto: 'tcp' }),
+    volumeMounts: () => ({ id: uid(), volume: '', target: '', readonly: false }),
+    env:          () => ({ key: '', value: '' }),
+    dotenv:       () => ({ key: '', value: '' }),
+    pairs:        () => ({ key: '', value: '' }),
+    driverOpts:   () => ({ key: '', value: '' })
+  };
+  return (F[key] || F.env)();
+}
+
+function cascade(listPath, item){
+  if (listPath === 'services') {
+    const nm = (item.name || '').trim();
+    state.services.forEach(s => { s.dependsOn = (s.dependsOn || []).filter(n => n !== nm); });
+    toast(nm ? 'Removed service "' + nm + '"' : 'Removed service');
+  } else if (listPath === 'volumes') {
+    const nm = (item.name || '').trim();
+    let n = 0;
+    state.services.forEach(s => {
+      const before = s.volumeMounts.length;
+      s.volumeMounts = s.volumeMounts.filter(m => m.volume !== nm);
+      n += before - s.volumeMounts.length;
+    });
+    toast(n ? 'Removed volume "' + nm + '" — detached from ' + n + ' mount' + (n === 1 ? '' : 's') : 'Removed volume "' + nm + '"');
+  } else if (listPath === 'networks') {
+    const nm = (item.name || '').trim();
+    let n = 0;
+    state.services.forEach(s => {
+      const i = s.networks.indexOf(nm);
+      if (i >= 0) { s.networks.splice(i, 1); n++; }
+    });
+    toast(n ? 'Removed network "' + nm + '" — detached from ' + n + ' service' + (n === 1 ? '' : 's') : 'Removed network "' + nm + '"');
+  } else if (listPath === 'docker.stages') {
+    const nm = (item.name || '').trim();
+    state.docker.stages.forEach(st => (st.steps || []).forEach(sp => { if (sp.from === nm) sp.from = ''; }));
+    toast('Removed stage "' + (nm || 'unnamed') + '"');
+  }
+}
+
+function doAction(name, arg){
+  if (name === 'dotenv-import') {
+    const ta = document.getElementById('env-paste');
+    if (!ta) return;
+    const rows = parseDotenv(ta.value);
+    if (!rows.length) { toast('Nothing to import — use KEY=VALUE lines'); return; }
+    const byKey = new Map(state.dotenv.filter(x => (x.key || '').trim()).map(x => [x.key, x]));
+    rows.forEach(r => {
+      const ex = byKey.get(r.key);
+      if (ex) ex.value = r.value;
+      else { state.dotenv.push(r); byKey.set(r.key, r); }
+    });
+    ta.value = '';
+    toast('Imported ' + rows.length + ' .env entr' + (rows.length === 1 ? 'y' : 'ies'));
+    structural();
+  } else if (name === 'loadenv') {
+    const svc = state.services[arg];
+    if (!svc) return;
+    let n = 0;
+    (state.dotenv || []).forEach(e => {
+      const k = (e.key || '').trim();
+      if (!k) return;
+      if ((svc.env || []).some(x => (x.key || '').trim() === k)) return;
+      svc.env.push({ key: k, value: '${' + k + '}' });
+      n++;
+    });
+    toast(n ? 'Inserted ' + n + ' .env reference row' + (n === 1 ? '' : 's') : 'All .env keys are already present (or .env is empty)');
+    structural();
+  }
+}
+
+function runAction(btn){
+  const p = String(btn.dataset.action || '').split('|');
+  const verb = p[0];
+  const listPath = p[1] || '';
+  if (verb === 'add') {
+    const list = getIn(state, listPath);
+    if (!Array.isArray(list)) return;
+    list.push(newItemFor(listPath));
+    structural();
+    return;
+  }
+  if (verb === 'del') {
+    const i = +p[2];
+    const list = getIn(state, listPath);
+    if (!Array.isArray(list) || !(i >= 0 && i < list.length)) return;
+    const item = list.splice(i, 1)[0];
+    cascade(listPath, item);
+    structural();
+    return;
+  }
+  if (verb === 'up' || verb === 'down') {
+    const i = +p[2];
+    const list = getIn(state, listPath);
+    if (!Array.isArray(list)) return;
+    const to = verb === 'up' ? i - 1 : i + 1;
+    if (to < 0 || to >= list.length) return;
+    list.splice(to, 0, list.splice(i, 1)[0]);
+    structural();
+    return;
+  }
+  if (verb === 'do') {
+    doAction(p[1], p[2] !== undefined && p[2] !== '' ? +p[2] : undefined);
+  }
+}
+
+/* ═══ 23 · Field mutation ═══════════════════════════════════════════════════ */
+
+function mutateField(el, ctl){
+  const path = ctl.dataset.field;
+  if (!path) return;
+  if (el.type === 'checkbox' && el.dataset.checklist !== undefined) {
+    const list = getIn(state, path);
+    if (!Array.isArray(list)) return;
+    const nm = String(el.dataset.checklist);
+    const idx = list.indexOf(nm);
+    if (el.checked && idx < 0) list.push(nm);
+    else if (!el.checked && idx >= 0) list.splice(idx, 1);
+    return;
+  }
+  const old = getIn(state, path);
+  const val = el.type === 'checkbox' ? el.checked : el.value;
+  setIn(state, path, val);
+  renameRefs(state, path, old, val);
+  syncRenamedDOM(path, old, val);
+}
+
+/* Keeps checkbox labels / select options in step with renamed services,
+   volumes, networks and stages without a full re-render (focus stays put). */
+function syncRenamedDOM(path, oldV, newV){
+  const m = /(?:^|\.)(services|volumes|networks|stages)\.(\d+)\.name$/.exec(String(path || ''));
+  if (!m || oldV == null || oldV === '' || newV === oldV) return;
+  const o = String(oldV), n = String(newV);
+  if (m[1] === 'volumes') {
+    formPanel.querySelectorAll('select[data-field$=".volume"]').forEach(sel => {
+      Array.from(sel.options).forEach(opt => { if (opt.value === o) { opt.value = n; opt.textContent = n; } });
+    });
+  } else {
+    formPanel.querySelectorAll('[data-checklist]').forEach(el => {
+      if (el.dataset.checklist === o) {
+        el.dataset.checklist = n;
+        const sp = el.closest('label') ? el.closest('label').querySelector('span') : null;
+        if (sp) sp.textContent = n;
+      }
+    });
+    if (m[1] === 'stages') {
+      formPanel.querySelectorAll('select[data-field$=".from"]').forEach(sel => {
+        Array.from(sel.options).forEach(opt => { if (opt.value === o) { opt.value = n; opt.textContent = n; } });
+      });
+    }
+  }
+}
+
+function onFormInput(e){
+  const el = e.target;
+  if (!(el instanceof Element)) return;
+  const ctl = el.closest('[data-field]');
+  if (!ctl) return;
+  mutateField(el, ctl);
+  if (ctl.dataset.re === 'section') structural();
+  else schedule();
+}
+
+/* ═══ 24 · Tab switching ════════════════════════════════════════════════════ */
+
+function switchTab(t){
+  if (state.activeTab === t) { renderPreview(); return; }
+  state.activeTab = t;
+  flush(false);
+}
+
+/* ═══ 25 · Wiring & bootstrap ═══════════════════════════════════════════════ */
+
+document.addEventListener('click', e => {
+  const t = e.target;
+  if (!(t instanceof Element)) return;
+  const navBtn = t.closest('[data-nav]');
+  if (navBtn) {
+    if (state.activeSection !== navBtn.dataset.nav) {
+      state.activeSection = navBtn.dataset.nav;
+      updateNav();
+      structural();
+    }
+    return;
+  }
+  const act = t.closest('[data-action]');
+  if (act) { runAction(act); return; }
+  const tab = t.closest('[data-tab]');
+  if (tab) { switchTab(tab.dataset.tab); return; }
+});
+
+formPanel.addEventListener('input', onFormInput);
+formPanel.addEventListener('change', onFormInput);
+
+/* Drag-to-reorder delegation (HTML5 DnD, applied to step rows) */
+document.addEventListener('dragstart', e => {
+  const row = e.target && e.target.closest ? e.target.closest('[data-draglist]') : null;
+  if (!row) return;
+  const listPath = row.getAttribute('data-draglist');
+  const idx = +row.getAttribute('data-dragindex');
+  dragCtx = { listPath, idx };
+  row.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', String(idx)); } catch (_) {}
+});
+document.addEventListener('dragover', e => {
+  if (!dragCtx) return;
+  const row = e.target && e.target.closest ? e.target.closest('[data-draglist="' + dragCtx.listPath + '"]') : null;
+  if (!row) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const r = row.getBoundingClientRect();
+  const below = e.clientY > r.top + r.height / 2;
+  row.classList.toggle('drop-below', below);
+  row.classList.toggle('drop-above', !below);
+});
+document.addEventListener('drop', e => {
+  if (!dragCtx) return;
+  const row = e.target && e.target.closest ? e.target.closest('[data-draglist="' + dragCtx.listPath + '"]') : null;
+  if (!row) { return; }
+  e.preventDefault();
+  const list = getIn(state, dragCtx.listPath);
+  const below = row.classList.contains('drop-below');
+  document.querySelectorAll('.drop-above, .drop-below, .dragging').forEach(n => n.classList.remove('drop-above', 'drop-below', 'dragging'));
+  if (!Array.isArray(list)) { dragCtx = null; return; }
+  const from = dragCtx.idx;
+  let to = +row.getAttribute('data-dragindex');
+  if (below) to += 1;
+  dragCtx = null;
+  if (to === from || to === from + 1) return;
+  list.splice(to > from ? to - 1 : to, 0, list.splice(from, 1)[0]);
+  structural();
+});
+document.addEventListener('dragend', () => {
+  dragCtx = null;
+  document.querySelectorAll('.drop-above, .drop-below, .dragging').forEach(n => n.classList.remove('drop-above', 'drop-below', 'dragging'));
+});
+
+/* Preview tabs — roving tabindex + arrow / Home / End keyboard navigation */
+const tabsBar = document.querySelector('.pv-tabs');
+tabsBar.addEventListener('keydown', e => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+  e.preventDefault();
+  let cur = state.activeTab === 'compose' ? 1 : 0;
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') cur = (cur + 1) % 2;
+  else if (e.key === 'Home') cur = 0;
+  else cur = 1;
+  const id = cur === 0 ? 'dockerfile' : 'compose';
+  switchTab(id);
+  document.getElementById('tab-' + id).focus();
+});
+
+/* Topbar actions */
+btnCopy.addEventListener('click', () => {
+  copyText(state.activeTab === 'compose' ? gen.compose : gen.dockerfile, state.activeTab === 'compose' ? 'docker-compose.yml copied' : 'Dockerfile copied');
+});
+btnRunCopy.addEventListener('click', () => { if (gen.run) copyText(gen.run, 'docker run command copied'); });
+btnDownload.addEventListener('click', () => {
+  if (validation.errors.length) { toast('Resolve the validation errors first'); return; }
+  if (state.activeTab === 'compose') downloadFile('docker-compose.yml', gen.compose);
+  else downloadFile('Dockerfile', gen.dockerfile);
+});
+document.getElementById('btn-theme').addEventListener('click', () => {
+  state.theme = state.theme === 'dark' ? 'light' : 'dark';
+  applyTheme(state.theme);
+  persist();
+  toast(state.theme === 'dark' ? 'Dark theme' : 'Light theme');
+});
+document.getElementById('btn-reset').addEventListener('click', () => {
+  if (!window.confirm('Reset the entire configuration back to the default example? This cannot be undone.')) return;
+  const theme = state.theme;
+  state = seedState();
+  state.theme = theme;
+  applyTheme(state.theme);
+  renderNav();
+  flush(true);
+  toast('Reset to the default sample');
+});
+
+/* Bootstrap */
+state = normalize(state);
+applyTheme(state.theme);
+renderNav();
+flush(true);
+
+})();
+</script>
+</body>
+</html>
