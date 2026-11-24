@@ -796,7 +796,10 @@ function emitKeyValue(key, value, indent, out) {
   const pad = '  '.repeat(indent);
   const k = yKey(key);
   if (value instanceof RawString) { out.push(pad + k + ': ' + value.v); return; }
-  if (value === null || value === undefined || value === '') return;
+  // An empty string in map position is a real value (e.g. environment: MY_FLAG=)
+  // — emit it explicitly; only null/undefined mean "no key at all".
+  if (value === '') { out.push(pad + k + ": ''"); return; }
+  if (value === null || value === undefined) return;
   if (typeof value !== 'object') { out.push(pad + k + ': ' + yScalar(value)); return; }
   if (Array.isArray(value)) {
     if (!value.length) { out.push(pad + k + ': []'); return; }
@@ -947,8 +950,12 @@ function emitStepLines(s, out) {
       if (!c) return;
       const parts = c.split(/\s*&&\s*/);
       if (parts.length > 1) {
-        out.push('RUN ' + parts[0]);
-        for (let i = 1; i < parts.length; i++) out.push('    && ' + parts[i]);
+        // Dockerfile line continuation: every line except the last must end with
+        // a trailing \ or Docker rejects the file ("unknown instruction: &&").
+        out.push('RUN ' + parts[0] + ' \\');
+        for (let i = 1; i < parts.length; i++) {
+          out.push('    && ' + parts[i] + (i < parts.length - 1 ? ' \\' : ''));
+        }
       } else {
         out.push('RUN ' + c);
       }
@@ -1040,12 +1047,19 @@ function envFileText() {
   return rows.join('\n') + '\n';
 }
 
+// POSIX single-quoting: $, ` and \ stay literal inside single quotes; embedded
+// single quotes are closed-and-escaped as '\'' so the user's shell never expands them.
+function shQuote(v) {
+  if (!/[^\w@%+=:,./-]/.test(v)) return v;
+  return "'" + v.replace(/'/g, "'\\''") + "'";
+}
+
 function dockerRunCmd() {
   const s = state.services[0];
   if (!s) return '# define a service first';
   const name = s.name.trim() || 'app';
   const parts = ['docker run'];
-  if (s.containerName.trim()) parts.push('--name ' + s.containerName.trim());
+  if (s.containerName.trim()) parts.push('--name ' + shQuote(s.containerName.trim()));
   s.ports.forEach(p => {
     const hst = p.host.trim(), cnt = p.container.trim();
     if (hst && cnt) parts.push('-p ' + hst + ':' + cnt + (p.proto === 'udp' ? '/udp' : ''));
@@ -1056,18 +1070,17 @@ function dockerRunCmd() {
   s.env.forEach(e => {
     const k = e.key.trim();
     if (!k) return;
-    const v = e.value;
-    parts.push('-e ' + k + '=' + (/^\s|\s$|\s/.test(v) || v === '' ? '"' + v.replace(/"/g, '\\"') + '"' : v));
+    parts.push('-e ' + k + '=' + shQuote(e.value));
   });
   if (s.restart && s.restart !== 'no') parts.push('--restart ' + s.restart);
   s.networks.forEach(n => parts.push('--network ' + n));
   const img = s.source === 'image' ? (s.image.trim() || name) : name;
   parts.push(img);
   const cmd = s.command.trim();
-  if (cmd) parts.push(s.commandStyle === 'exec' ? splitArgs(cmd).join(' ') : cmd);
+  if (cmd) parts.push(s.commandStyle === 'exec' ? splitArgs(cmd).map(shQuote).join(' ') : cmd);
   const run = parts.join(' ');
   if (s.source === 'build') {
-    return 'docker build -t ' + img + ' ' + (s.buildPath.trim() || '.') + '\n' + run;
+    return 'docker build -t ' + img + ' ' + shQuote(s.buildPath.trim() || '.') + '\n' + run;
   }
   return run;
 }
@@ -1076,17 +1089,15 @@ function dockerRunCmd() {
    6. Validation
    ========================================================================= */
 function collectVarRefs() {
+  // Scan the generated compose file itself instead of a hand-picked subset of
+  // fields: compose interpolates ${VAR} everywhere — env values, ports, image,
+  // container_name, volume mounts, networks, depends_on, command — so a full
+  // scan keeps the "${VAR} referenced but undefined in .env" warning honest.
   const refs = new Set();
-  const scan = text => {
-    const re = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
-    let m;
-    while ((m = re.exec(String(text)))) refs.add(m[1]);
-  };
-  state.services.forEach(svc => {
-    svc.env.forEach(e => { scan(e.value); scan(e.key); });
-    scan(svc.command);
-    if (svc.healthcheck.enabled) scan(svc.healthcheck.cmd);
-  });
+  const re = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+  let m;
+  const text = emitComposeYaml();
+  while ((m = re.exec(text))) refs.add(m[1]);
   return refs;
 }
 
@@ -1095,7 +1106,9 @@ function validate() {
   const warnings = [];
   const E = (path, msg) => errors.push({ path, msg });
   const multi = !!state.docker.multi;
-  const stages = state.docker.stages;
+  // Validate exactly what the form renders and the emitter writes: in single-stage
+  // mode hidden leftover stages must not produce download-blocking errors.
+  const stages = multi ? state.docker.stages : state.docker.stages.slice(0, 1);
 
   const stageNames = stages.map(st => st.name.trim());
   stages.forEach((st, i) => {
@@ -1120,6 +1133,9 @@ function validate() {
       }
       if (s.type === 'EXPOSE' && s.port.trim() && !EXPOSE_RX.test(s.port.trim())) {
         E(sp + '.port', `EXPOSE "${s.port.trim()}" is not a valid port (digits or a range)`);
+      }
+      if (s.type === 'HEALTHCHECK' && !s.hc.cmd.trim()) {
+        warnings.push(`Stage ${i + 1} step ${j + 1}: HEALTHCHECK step has no test command — will be emitted as HEALTHCHECK NONE, which disables any healthcheck inherited from the base image`);
       }
     });
   });
@@ -1178,8 +1194,8 @@ function validate() {
       if (!svc.buildPath.trim()) E(sp + '.build', 'Build context path is required when the "build" source is selected');
       const tgt = svc.buildTarget.trim();
       if (tgt) {
-        if (!multi) E(sp + '.target', 'Build target requires a multi-stage Dockerfile');
-        else if (!stageNames.includes(tgt)) E(sp + '.target', `Build target "${tgt}" is not a defined stage`);
+        if (!multi) E(sp + '.buildTarget', 'Build target requires a multi-stage Dockerfile');
+        else if (!stageNames.includes(tgt)) E(sp + '.buildTarget', `Build target "${tgt}" is not a defined stage`);
       }
     }
     svc.ports.forEach((p, j) => {
@@ -1426,7 +1442,9 @@ function stepRow(st, stageIdx, s, j) {
   li.dataset.index = String(j);
 
   const head = h('div', { class: 'step-head' });
-  const grip = h('span', { class: 'grip', draggable: 'true', role: 'button', tabindex: '0', 'aria-label': `Drag step ${j + 1} to reorder`, title: 'Drag to reorder (or use the arrow buttons)' });
+  // Purely a drag affordance (the ▲/▼ buttons are the keyboard path), so it is
+  // hidden from the a11y tree rather than exposed as an inert pseudo-button.
+  const grip = h('span', { class: 'grip', draggable: 'true', 'aria-hidden': 'true', title: 'Drag to reorder (or use the arrow buttons)' });
   grip.append(icon('grip', 15));
   const num = h('span', { class: 'step-num' });
   num.textContent = String(j + 1);
@@ -1586,16 +1604,16 @@ function serviceCard(svc, i) {
     if (state.docker.multi) {
       const stageNames = state.docker.stages.map(x => x.name.trim()).filter(Boolean);
       const opts = [{ v: '', label: '(none)' }].concat(stageNames.map(n => ({ v: n })));
-      const sel = selectInput(sp + '.target', svc.buildTarget, opts, { aria: 'Build target stage' });
+      const sel = selectInput(sp + '.buildTarget', svc.buildTarget, opts, { aria: 'Build target stage' });
       if (svc.buildTarget && !stageNames.includes(svc.buildTarget)) {
         const op = h('option', { value: svc.buildTarget });
         op.textContent = svc.buildTarget;
         sel.append(op);
         sel.value = svc.buildTarget;
       }
-      g.append(fld('Target stage (optional)', sel, { err: sp + '.target', hint: 'Final FROM stage of a multi-stage Dockerfile' }));
+      g.append(fld('Target stage (optional)', sel, { err: sp + '.buildTarget', hint: 'Final FROM stage of a multi-stage Dockerfile' }));
     } else if (svc.buildTarget) {
-      g.append(fld('Target stage (optional)', textInput(sp + '.target', svc.buildTarget, {}), { err: sp + '.target', hint: 'Enable multi-stage in the Image section — no stages exist yet' }));
+      g.append(fld('Target stage (optional)', textInput(sp + '.buildTarget', svc.buildTarget, {}), { err: sp + '.buildTarget', hint: 'Enable multi-stage in the Image section — no stages exist yet' }));
     }
     srcRow.append(g);
   }
@@ -1631,6 +1649,10 @@ function serviceCard(svc, i) {
       const nm = o.name.trim() || '(unnamed service)';
       const lb = h('label', { class: 'check-line' });
       const cb = checkInput(sp + '.dependsOn', svc.dependsOn.includes(o.name.trim()), 'list-toggle', o.name.trim());
+      // Inline-error plumbing so depends_on reference errors surface at the field:
+      // markFieldErrors() reads data-err and toggles the shared depErr box below.
+      cb.setAttribute('data-err', sp + '.dependsOn');
+      cb.setAttribute('aria-describedby', errId(sp + '.dependsOn'));
       const tx = h('span', { class: 'txt' });
       tx.textContent = nm;
       lb.append(cb, tx);
@@ -1865,6 +1887,13 @@ function applyRename(oldName, bind, newName) {
     state.docker.stages.forEach((st, j) => {
       if (j > si) st.steps.forEach(s => { if (s.from === oldName) s.from = newName; });
     });
+    state.services.forEach(o => { if (o.buildTarget === oldName) o.buildTarget = newName; });
+    document.querySelectorAll('#form select[data-field$=".buildTarget"]').forEach(sel => {
+      Array.from(sel.options).forEach(op => {
+        if (op.value === oldName) { op.value = newName; op.textContent = newName; }
+      });
+      if (sel.value === oldName) sel.value = newName;
+    });
     document.querySelectorAll('#form select[data-field$=".from"]').forEach(sel => {
       Array.from(sel.options).forEach(op => {
         if (op.value === oldName) { op.value = newName; op.textContent = newName; }
@@ -1971,8 +2000,16 @@ function handleAction(btn) {
       state.docker.stages.forEach(st => st.steps.forEach(s => {
         if (s.from && names.indexOf(s.from) === -1) { s.from = ''; cleared++; }
       }));
+      let clearedTargets = 0;
+      state.services.forEach(o => {
+        if (o.buildTarget && names.indexOf(o.buildTarget) === -1) { o.buildTarget = ''; clearedTargets++; }
+      });
       renderSection(); regen();
-      toast('Stage removed' + (cleared ? ' — cleared ' + cleared + ' dangling --from reference(s)' : ''));
+      const notes = [
+        cleared ? 'cleared ' + cleared + ' dangling --from reference(s)' : '',
+        clearedTargets ? 'cleared ' + clearedTargets + ' dangling build target(s)' : '',
+      ].filter(Boolean).join(', ');
+      toast('Stage removed' + (notes ? ' — ' + notes : ''));
       return;
     }
     case 'add-step': {
@@ -2246,7 +2283,7 @@ function renderPreview() {
   document.getElementById('btn-copy').title = 'Copy ' + (tab === 'compose' ? 'docker-compose.yml' : 'the Dockerfile') + ' to the clipboard';
 
   document.getElementById('gen-status').textContent =
-    (tab === 'compose' ? 'compose.yml' : 'Dockerfile') + ' updated · ' + lines.length + ' lines · ' +
+    (tab === 'compose' ? 'docker-compose.yml' : 'Dockerfile') + ' updated · ' + lines.length + ' lines · ' +
     (nErr === 0 ? '0 errors' : nErr + ' error' + (nErr === 1 ? '' : 's')) +
     (lastValidation.warnings.length ? ' · ' + lastValidation.warnings.length + ' warning(s)' : '');
 }
