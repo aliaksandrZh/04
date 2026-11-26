@@ -49,7 +49,8 @@ function onDragEnd(): void {
 
 <template>
   <section class="list-section">
-    <TransitionGroup v-if="tasks.length" tag="ul" name="task" class="task-list">
+    <!-- Always mounted so a task's removal (including the last one) animates. -->
+    <TransitionGroup tag="ul" name="task" class="task-list">
       <TaskItem
         v-for="task in tasks"
         :key="task.id"
@@ -64,7 +65,7 @@ function onDragEnd(): void {
         @dragend="onDragEnd"
       />
     </TransitionGroup>
-    <p v-else class="empty-state">{{ emptyMessage }}</p>
+    <p v-if="!tasks.length" class="empty-state">{{ emptyMessage }}</p>
   </section>
 </template>
 
